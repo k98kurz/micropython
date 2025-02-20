@@ -65,6 +65,7 @@ SRC_EXTMOD_C += \
 	extmod/virtpin.c \
 	shared/libc/abort_.c \
 	shared/libc/printf.c \
+	extmod/tweetnacl/tweetnacl.c \
 
 SRC_THIRDPARTY_C += \
 

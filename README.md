@@ -1,3 +1,19 @@
+# Micropycelium customization
+
+The micropycelium code is in `ports/esp32/modules/micropycelium.py`.
+
+## Experimental Modules
+
+### TweetNaCl
+
+TweetNaCl is a port of NaCl optimized for small code size, which made it easy to
+port. However, the performance is not very good. It remains in this project for
+now because I have not completed the libsodium fork for micropython.
+
+The files are in the extmod/tweetnacl directory.
+
+# MicroPython
+
 [![Unix CI badge](https://github.com/micropython/micropython/actions/workflows/ports_unix.yml/badge.svg)](https://github.com/micropython/micropython/actions?query=branch%3Amaster+event%3Apush) [![STM32 CI badge](https://github.com/micropython/micropython/actions/workflows/ports_stm32.yml/badge.svg)](https://github.com/micropython/micropython/actions?query=branch%3Amaster+event%3Apush) [![Docs CI badge](https://github.com/micropython/micropython/actions/workflows/docs.yml/badge.svg)](https://docs.micropython.org/) [![codecov](https://codecov.io/gh/micropython/micropython/branch/master/graph/badge.svg?token=I92PfD05sD)](https://codecov.io/gh/micropython/micropython)
 
 The MicroPython project
