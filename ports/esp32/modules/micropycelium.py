@@ -38,10 +38,16 @@ else:
 
 VERSION = micropython.const(0)
 DEBUG = True
+MODEM_SLEEP_MS = micropython.const(90)
+MODEM_WAKE_MS = micropython.const(40)
+MODEM_INTERSECT_INTERVAL = micropython.const(int(0.9 * MODEM_WAKE_MS))
+MODEM_INTERSECT_RTX_TIMES = micropython.const(
+    int((MODEM_SLEEP_MS+MODEM_WAKE_MS)/MODEM_INTERSECT_INTERVAL) + 1
+)
 
-def debug(msg: str):
+def debug(*args):
     if DEBUG:
-        print(msg)
+        print(*args)
 
 def trace(cls_or_fn, prefix: str = ''):
     if type(cls_or_fn) is type:
@@ -812,13 +818,16 @@ class Interface:
     send_func_async: Callable|None
     broadcast_func: Callable|None
     broadcast_func_async: Callable|None
+    wake_func: Callable|None
+    _hooks: dict[str, Callable]
 
     def __init__(self, name: str, bitrate: int, configure: Callable,
                  supported_schemas: list[int], receive_func: Callable = None,
                  send_func: Callable = None, broadcast_func: Callable = None,
                  receive_func_async: Callable = None,
                  send_func_async: Callable = None,
-                 broadcast_func_async: Callable = None) -> None:
+                 broadcast_func_async: Callable = None,
+                 wake_func: Callable = None) -> None:
         """Initialize an Interface. Note that the 0th item in the
             supported_schemas argument is used as the default Schema ID.
         """
@@ -840,55 +849,71 @@ class Interface:
         self.receive_func_async = receive_func_async
         self.send_func_async = send_func_async
         self.broadcast_func_async = broadcast_func_async
+        self.wake_func = wake_func
+        self._hooks = {}
 
     def configure(self, data: dict) -> None:
         """Call the configure callback, passing self and data."""
+        self.call_hook('configure', self, data)
         self._configure(self, data)
+
+    def wake(self) -> None:
+        """Wakes the Interface after a modem sleep cycle."""
+        self.call_hook('wake', self)
+        if callable(self.wake_func):
+            self.wake_func(self)
 
     def receive(self) -> Datagram|None:
         """Returns a datagram if there is one or None."""
+        self.call_hook('receive', self)
         return self.inbox.popleft() if len(self.inbox) else None
 
     def send(self, datagram: Datagram) -> None:
         """Puts a datagram into the outbox."""
+        self.call_hook('send', self, datagram)
         self.outbox.append(datagram)
 
     def broadcast(self, datagram: Datagram) -> None:
         """Puts a datagram into the castbox."""
+        self.call_hook('broadcast', datagram)
         self.castbox.append(datagram)
 
     async def process(self):
         """Process Interface actions."""
+        self.call_hook('process')
         if self.receive_func:
             datagram = self.receive_func(self)
             if datagram:
-                debug(f'Interface({self.name}).process:receive')
+                self.call_hook('process:receive', datagram)
                 self.inbox.append(datagram)
         elif self.receive_func_async:
             datagram = await self.receive_func_async(self)
             if datagram:
-                debug(f'Interface({self.name}).process:receive_async')
+                self.call_hook('process:receive_async', datagram)
                 self.inbox.append(datagram)
 
         if len(self.outbox):
-            debug(f'Interface({self.name}).process:send')
+            datagram = self.outbox.popleft()
+            self.call_hook('process:send', datagram)
             if self.send_func:
-                self.send_func(self.outbox.popleft())
+                self.send_func(datagram)
             elif self.send_func_async:
-                await self.send_func_async(self.outbox.popleft())
+                await self.send_func_async(datagram)
 
         if len(self.castbox):
-            debug(f'Interface({self.name}).process:broadcast')
+            datagram = self.castbox.popleft()
+            self.call_hook('process:broadcast', datagram)
             if self.broadcast_func:
-                self.broadcast_func(self.castbox.popleft())
+                self.broadcast_func(datagram)
             elif self.broadcast_func_async:
-                await self.broadcast_func_async(self.castbox.popleft())
+                await self.broadcast_func_async(datagram)
 
     def validate(self) -> bool:
         """Returns False if the interface does not have all required methods
             and attributes, or if they are not the proper types. Otherwise
             returns True.
         """
+        self.call_hook('validate', self)
         if not hasattr(self, 'supported_schemas') or \
             type(self.supported_schemas) is not list or \
             not all([type(i) is int for i in self.supported_schemas]):
@@ -902,6 +927,13 @@ class Interface:
         if not callable(self.broadcast_func) and not callable(self.broadcast_func_async):
             return False
         return True
+
+    def add_hook(self, name: str, hook: Callable):
+        self._hooks[name] = hook
+
+    def call_hook(self, name: str, *args, **kwargs):
+        if name in self._hooks:
+            self._hooks[name](self, *args, **kwargs)
 
 
 # @micropython.native
@@ -967,7 +999,7 @@ class Application:
     id: bytes
     receive_func: Callable
     callbacks: dict[str, Callable]
-    hooks: dict[str, Callable]
+    _hooks: dict[str, Callable]
 
     def __init__(self, name: str, description: str, version: int,
                  receive_func: Callable, callbacks: dict = {}) -> None:
@@ -984,15 +1016,15 @@ class Application:
         )).digest()[:16]
         self.receive_func = receive_func
         self.callbacks = callbacks
-        self.hooks = {}
+        self._hooks = {}
 
     def add_hook(self, name: str, callback: Callable):
-        self.hooks[name] = callback
+        self._hooks[name] = callback
 
     def receive(self, blob: bytes, intrfc: Interface, mac: bytes):
         """Passes self, blob, and intrfc to the receive_func callback."""
-        if 'receive' in self.hooks:
-            self.hooks['receive'](self, blob, intrfc, mac)
+        if 'receive' in self._hooks:
+            self._hooks['receive'](self, blob, intrfc, mac)
         self.receive_func(self, blob, intrfc, mac)
 
     def available(self, name: str|None = None) -> list[str]|bool:
@@ -1008,10 +1040,10 @@ class Application:
             result of the function call. If the callback is async, a
             coroutine will be returned.
         """
-        if 'invoke' in self.hooks:
-            self.hooks['invoke'](self, name, *args, **kwargs)
-        if name in self.hooks:
-            self.hooks[name](self, *args, **kwargs)
+        if 'invoke' in self._hooks:
+            self._hooks['invoke'](self, name, *args, **kwargs)
+        if name in self._hooks:
+            self._hooks[name](self, *args, **kwargs)
         return (self.callbacks[name](self, *args, **kwargs)) if name in self.callbacks else None
 
 
@@ -1064,19 +1096,31 @@ class Packager:
     new_events: deque[Event] = deque([], 64)
     cancel_events: deque[bytes] = deque([], 64)
     running: bool = False
-    sleepskip: deque[bool] = deque([], 20)
+    sleepskip: deque[bool] = deque([], 10)
+    _hooks: dict[str, Callable] = {}
+
+    @classmethod
+    def add_hook(cls, name: str, hook: Callable):
+        cls._hooks[name] = hook
+
+    @classmethod
+    def call_hook(cls, name: str, *args, **kwargs):
+        if name in cls._hooks:
+            cls._hooks[name](cls, *args, **kwargs)
 
     @classmethod
     def add_interface(cls, interface: Interface):
         """Adds an interface. Raises AssertionError if it does not meet
             the requirements for a network interface.
         """
+        cls.call_hook('add_interface', cls, interface)
         assert interface.validate()
         cls.interfaces.append(interface)
 
     @classmethod
     def remove_interface(cls, interface: Interface):
         """Removes a network interface."""
+        cls.call_hook('remove_interface', cls, interface)
         cls.interfaces.remove(interface)
 
     @classmethod
@@ -1084,7 +1128,7 @@ class Packager:
         """Adds a peer to the local peer list. Packager will be able to
             send Packages to all such peers.
         """
-        debug(f'Packager.add_peer: {peer_id.hex()=}')
+        cls.call_hook('add_peer', cls, peer_id, interfaces)
         if peer_id not in cls.peers:
             cls.peers[peer_id] = Peer(peer_id, interfaces)
         peer = cls.peers[peer_id]
@@ -1092,12 +1136,14 @@ class Packager:
             if mac not in (i[0] for i in peer.interfaces):
                 peer.interfaces[mac] = intrfc
         peer.last_rx = int(time()*1000)
+        peer.timeout = 4
 
     @classmethod
     def remove_peer(cls, peer_id: bytes):
         """Removes a peer from the local peer list. Packager will be
             unable to send Packages to this peer.
         """
+        cls.call_hook('remove_peer', cls, peer_id)
         if peer_id in cls.peers:
             peer = cls.peers.pop(peer_id)
             for addr in peer.addrs:
@@ -1110,6 +1156,7 @@ class Packager:
             Address for the peer to maintain routability during tree
             state transitions.
         """
+        cls.call_hook('add_route', cls, node_id, address)
         if node_id in cls.peers:
             addrs = cls.peers[node_id].addrs
             if len(addrs) > 1 and address not in addrs:
@@ -1121,6 +1168,7 @@ class Packager:
     @classmethod
     def remove_route(cls, address: Address):
         """Removes the route to the peer with the given address."""
+        cls.call_hook('remove_route', cls, address)
         if address in cls.routes:
             cls.routes.pop(address)
 
@@ -1130,6 +1178,7 @@ class Packager:
             preserving the previous address to maintain routability
             between tree state transitions.
         """
+        cls.call_hook('set_addr', cls, addr)
         cls.node_addrs.append(addr)
         while len(cls.node_addrs) > 2:
             cls.node_addrs.popleft()
@@ -1141,6 +1190,9 @@ class Packager:
             by all interfaces. Returns False if no schemas could be
             found that are supported by all interfaces.
         """
+        cls.sleepskip.append(True)
+        # cls.sleepskip.extend([True for _ in range(MODEM_INTERSECT_RTX_TIMES)])
+        cls.call_hook('broadcast', cls, app_id, blob, interface)
         schema: Schema
         chosen_intrfcs: list[Interface]
         if interface:
@@ -1193,6 +1245,7 @@ class Packager:
             if it cannot (i.e. if it is not a known peer and there is
             not a known route to the node).
         """
+        cls.call_hook('send', cls, app_id, blob, node_id, schema)
         islocal = node_id in cls.peers
         if not islocal and node_id not in [r for a, r in cls.routes.items()]:
             return False
@@ -1264,6 +1317,7 @@ class Packager:
             passed, the Interfaces for those nodes with ids specified in
             the list will be excluded from consideration.
         """
+        cls.call_hook('get_interface', cls, node_id, to_addr, exclude)
         if node_id in cls.peers and node_id not in exclude:
             # direct neighbors
             intrfcs = cls.peers[node_id].interfaces
@@ -1297,30 +1351,45 @@ class Packager:
             return (None, None, None)
 
     @classmethod
-    def rns(cls, peer_id: bytes, intrfc_id: bytes, retries: int = 10):
-        """Send RNS if one has not been sent in the last 20 ms,
-            otherwise update the event.
+    def rns(cls, peer_id: bytes, intrfc_id: bytes,
+            retries: int = MODEM_INTERSECT_RTX_TIMES):
+        """Send RNS if one has not been sent in the last
+            MODEM_INTERSECT_INTERVAL ms, otherwise update the event.
         """
+        cls.call_hook('rns', cls, peer_id, intrfc_id, retries)
         eid = b'rns'+peer_id+intrfc_id
         now = int(time()*1000)
         if eid in [e.id for e in cls.new_events]:
             return # do not add a duplicate event
 
+        if peer_id not in cls.peers:
+            # dropped peer, so drop attempt to contact
+            return
+
+        peer = cls.peers[peer_id]
+
         if retries < 1:
             # clear queue and drop the attempts
-            q = cls.peers[peer_id].queue
+            q = peer.queue
             while len(q):
                 q.popleft()
             return
 
         # queue event and send RNS
-        event = Event(now+20, eid, cls.rns, peer_id, intrfc_id, retries=retries-1)
+        event = Event(
+            now + MODEM_INTERSECT_INTERVAL,
+            eid,
+            cls.rns,
+            peer_id,
+            intrfc_id,
+            retries=retries-1
+        )
         cls.new_events.append(event)
         flags = Flags(0)
         flags.rns = True
         intrfc = [i for i in cls.interfaces if i.id == intrfc_id][0]
         mac = [
-            mac for mac, i in cls.peers[peer_id].interfaces
+            mac for mac, i in peer.interfaces
             if i.id == intrfc_id
         ][0]
         intrfc.send(Datagram(
@@ -1338,7 +1407,9 @@ class Packager:
         """Sends a Datagram on the appropriate interface. Raises
             AssertionError if the interface ID is invalid.
         """
-        cls.sleepskip.extend([True, True, True, True, True, True, True, True, True, True])
+        cls.call_hook('_send_datagram', cls, dgram, peer)
+        cls.sleepskip.append(True)
+        # cls.sleepskip.extend([True for _ in range(MODEM_INTERSECT_RTX_TIMES)])
         assert dgram.intrfc_id in [i.id for i in cls.interfaces]
         intrfc = [i for i in cls.interfaces if i.id == dgram.intrfc_id][0]
         if peer.can_tx:
@@ -1355,6 +1426,7 @@ class Packager:
             send toward the from_addr field (no ttl decrement). Returns
             False if it cannot be sent.
         """
+        cls.call_hook('send_packet', cls, packet, node_id)
         if node_id in cls.peers:
             # direct neighbors
             mac, intrfc, peer = cls.get_interface(node_id)
@@ -1388,6 +1460,7 @@ class Packager:
     @classmethod
     def sync_sequence(cls, seq_id: int):
         """Requests retransmission of any missing packets."""
+        cls.call_hook('sync_sequence', cls, seq_id)
         seq = cls.in_seqs[seq_id]
         if seq.retry <= 0:
             # drop sequence because the originator is not responding to rtx
@@ -1439,7 +1512,9 @@ class Packager:
             if that fails, set the error flag and transmit backwards
             through the route.
         """
-        cls.sleepskip.extend([True, True, True, True, True, True, True, True, True, True])
+        cls.call_hook('receive', cls, p, intrfc, mac)
+        cls.sleepskip.append(True)
+        # cls.sleepskip.extend([True for _ in range(MODEM_INTERSECT_RTX_TIMES)])
         src = b'' # source of Packet
         if 'to_addr' in p.fields:
             if p.fields['to_addr'] not in [a.address for a in cls.node_addrs]:
@@ -1501,6 +1576,7 @@ class Packager:
                 ))
         elif p.flags.nia and len(src):
             # peer responded to RNS: cancel event, update peer.last_rx
+            cls.call_hook('receive:nia', cls, p, intrfc, mac)
             peer = cls.peers[src]
             eid = b'rns'+peer.id+intrfc.id
             cls.cancel_events.append(eid)
@@ -1508,6 +1584,7 @@ class Packager:
             return
         elif p.flags.rns and len(src):
             # peer sent RNS: send NIA
+            cls.call_hook('receive:rns', cls, p, intrfc, mac)
             peer = cls.peers[src]
             flags = Flags(0)
             flags.nia = True
@@ -1550,6 +1627,7 @@ class Packager:
             was not registered, or if the Application's receive method
             errors. Otherwise returns True.
         """
+        cls.call_hook('deliver', cls, p, i, m)
         if p.half_sha256 != sha256(p.blob).digest()[:16] or p.app_id not in cls.apps:
             return False
         try:
@@ -1561,11 +1639,13 @@ class Packager:
     @classmethod
     def add_application(cls, app: Application):
         """Registers an Application to accept Package delivery."""
+        cls.call_hook('add_application', cls, app)
         cls.apps[app.id] = app
 
     @classmethod
     def remove_appliation(cls, app: Application|bytes):
         """Deregisters an Application to no longer accept Package delivery."""
+        cls.call_hook('remove_application', cls, app)
         if isinstance(app, Application):
             app = app.id
         cls.apps.pop(app)
@@ -1576,11 +1656,13 @@ class Packager:
             will be added to the schedule, overwriting any event with
             the same ID.
         """
+        cls.call_hook('queue_event', cls, event)
         cls.new_events.append(event)
 
     @classmethod
     async def process(cls):
         """Process interface actions, then process Packager actions."""
+        cls.call_hook('process', cls)
         # schedule new events
         while len(cls.new_events):
             event = cls.new_events.popleft()
@@ -1642,7 +1724,8 @@ class Packager:
 
     @classmethod
     async def work(cls, interval_ms: int = 1, use_modem_sleep: bool = False,
-                   modem_sleep_ms: int = 90, modem_active_ms: int = 40):
+                   modem_sleep_ms: int = MODEM_SLEEP_MS,
+                   modem_active_ms: int = MODEM_WAKE_MS):
         """Runs the process method in a loop. If use_modem_sleep is True,
             lightsleep(modem_sleep_ms) will be called periodically to
             save battery, then the method will continue for at least
@@ -1650,6 +1733,7 @@ class Packager:
             process is eligible for a sleep cycle, an item will be
             popped off the queue and the cycle will be skipped.
         """
+        cls.call_hook('work', cls, interval_ms, use_modem_sleep, modem_sleep_ms, modem_active_ms)
         cls.running = True
         modem_cycle = 0
         ts = int(time()*1000)
@@ -1657,23 +1741,28 @@ class Packager:
             await cls.process()
             await asyncio.sleep(interval_ms / 1000)
             if use_modem_sleep:
-                if len(cls.sleepskip):
-                    cls.sleepskip.popleft()
-                    continue
                 modem_cycle = int(time()*1000) - ts
                 if modem_cycle > modem_active_ms:
                     modem_cycle = 0
-                    lightsleep(modem_sleep_ms)
+                    if len(cls.sleepskip):
+                        cls.call_hook('sleepskip')
+                        cls.sleepskip.popleft()
+                    else:
+                        cls.call_hook('modemsleep')
+                        lightsleep(modem_sleep_ms)
+                        for intrfc in cls.interfaces:
+                            intrfc.wake()
                     ts = int(time()*1000)
 
     @classmethod
     def stop(cls):
         """Sets cls.running to False for graceful shutdown of worker."""
+        cls.call_hook('stop', cls)
         cls.running = False
 
 
 # Interface for inter-Application communication.
-_iai_box: deque[Datagram] = deque([], 10)
+iai_box: deque[Datagram] = deque([], 10)
 _iai_config = {}
 
 InterAppInterface = Interface(
@@ -1681,9 +1770,9 @@ InterAppInterface = Interface(
     bitrate=1_000_000_000,
     configure=lambda _, d: _iai_config.update(d),
     supported_schemas=SCHEMA_IDS,
-    receive_func=lambda _: _iai_box.popleft() if len(_iai_box) else None,
-    send_func=lambda d: _iai_box.append(d),
-    broadcast_func=lambda d: _iai_box.append(d),
+    receive_func=lambda _: iai_box.popleft() if len(iai_box) else None,
+    send_func=lambda d: iai_box.append(d),
+    broadcast_func=lambda d: iai_box.append(d),
 )
 
 
@@ -1692,7 +1781,7 @@ Packager.node_id = sha256(sha256(unique_id()).digest()).digest()
 BeaconMessage = namedtuple("BeaconMessage", ['op', 'peer_id', 'apps'])
 seen: deque[BeaconMessage] = deque([], 10)
 sent: deque[BeaconMessage] = deque([], 10)
-app_id = b''
+beacon_app_id = b''
 
 
 def serialize_bm(bmsg: BeaconMessage):
@@ -1719,7 +1808,7 @@ def receive_bm(app: Application, blob: bytes, intrfc: Interface, mac: bytes):
 
         if bmsg.op == b'\x00':
             # respond
-            Beacon.invoke('send', bmsg.peer_id)
+            Beacon.invoke('respond', bmsg.peer_id)
 
 def get_bmsgs(op: bytes):
     # cache values in local scope
@@ -1742,25 +1831,41 @@ def get_bmsgs(op: bytes):
     return bmsgs
 
 def send_beacon(pid: bytes):
+    bmsgs = get_bmsgs(b'\x00')
+    for bm in bmsgs:
+        # send the BeaconMessage in a Package
+        Packager.send(beacon_app_id, serialize_bm(bm), pid)
+
+def respond_beacon(pid: bytes):
     bmsgs = get_bmsgs(b'\x01')
     for bm in bmsgs:
         # send the BeaconMessage in a Package
-        Packager.send(app_id, serialize_bm(bm), pid)
+        Packager.send(beacon_app_id, serialize_bm(bm), pid)
 
 def broadcast_beacon():
     bmsgs = get_bmsgs(b'\x00')
     for bm in bmsgs:
         # broadcast the BeaconMessage in a Package
-        Packager.broadcast(app_id, serialize_bm(bm))
+        Packager.broadcast(beacon_app_id, serialize_bm(bm))
+
+def timeout_peers():
+    tdc = []
+    for pid, peer in Packager.peers.items():
+        peer.timeout -= 1
+        if peer.timeout <= 0:
+            tdc.append(pid)
+    for pid in tdc:
+        Packager.remove_peer(pid)
 
 def periodic_beacon(count: int):
     """Broadcasts count times with a 30ms delay between."""
     if count <= 0:
+        timeout_peers()
         return schedule_beacon()
     Beacon.invoke('broadcast')
     Packager.new_events.append(Event(
-        now() + 30,
-        app_id,
+        now() + MODEM_INTERSECT_INTERVAL,
+        beacon_app_id,
         periodic_beacon,
         count - 1
     ))
@@ -1769,11 +1874,13 @@ def schedule_beacon():
     """Schedules the periodic_beacon event to begin broadcasting after
         60s.
     """
+    if beacon_app_id+b's' in Packager.schedule:
+        return
     Packager.new_events.append(Event(
         now() + 60_000,
-        app_id,
+        beacon_app_id+b's',
         periodic_beacon,
-        10
+        MODEM_INTERSECT_RTX_TIMES
     ))
 
 Beacon = Application(
@@ -1784,13 +1891,14 @@ Beacon = Application(
     callbacks={
         'broadcast': lambda _: broadcast_beacon(),
         'send': lambda _, pid: send_beacon(pid),
+        'respond': lambda _, pid: respond_beacon(pid),
         'get_bmsgs': lambda _, op: get_bmsgs(op),
         'serialize': lambda _, bm: serialize_bm(bm),
         'deserialize': lambda _, blob: deserialize_bm(blob),
-        'start': lambda _: periodic_beacon(10),
+        'start': lambda _: periodic_beacon(MODEM_INTERSECT_RTX_TIMES),
     }
 )
-app_id = Beacon.id
+beacon_app_id = Beacon.id
 
 Packager.add_application(Beacon)
 
@@ -1803,6 +1911,10 @@ sta_if.config(channel=14)
 e = espnow.ESPNow()
 e.active(True)
 e.add_peer(b'\xff\xff\xff\xff\xff\xff')
+
+def wake_espnwintrfc(*args, **kwargs):
+    sta_if.active(True)
+    sta_if.config(channel=14)
 
 def config_espnwintrfc(intrfc: Interface, data: dict):
     for k,v in data.items():
@@ -1830,6 +1942,7 @@ ESPNowInterface = Interface(
     receive_func=recv_espnwintrfc,
     send_func=send_espnwintrfc,
     broadcast_func=broadcast_espnwintrfc,
+    wake_func=wake_espnwintrfc,
 )
 
 Packager.add_interface(ESPNowInterface)
