@@ -2,6 +2,8 @@
 
 The micropycelium code is in `ports/esp32/modules/micropycelium.py`.
 
+An editor is in `ports/esp32/modules/editor.py`.
+
 ## Experimental Modules
 
 ### TweetNaCl
@@ -10,7 +12,7 @@ TweetNaCl is a port of NaCl optimized for small code size, which made it easy to
 port. However, the performance is not very good. It remains in this project for
 now because I have not completed the libsodium fork for micropython.
 
-The files are in the extmod/tweetnacl directory.
+The files are in the extmod/tweetnacl and examples/tweetnacl directories.
 
 # MicroPython
 
