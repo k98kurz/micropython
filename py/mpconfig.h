@@ -30,7 +30,7 @@
 // as well as a fallback to generate MICROPY_GIT_TAG if the git repo or tags
 // are unavailable.
 #define MICROPY_VERSION_MAJOR 1
-#define MICROPY_VERSION_MINOR 24
+#define MICROPY_VERSION_MINOR 25
 #define MICROPY_VERSION_MICRO 0
 #define MICROPY_VERSION_PRERELEASE 1
 
@@ -342,6 +342,11 @@
 #define MICROPY_PERSISTENT_CODE_SAVE_FILE (0)
 #endif
 
+// Whether to support converting functions to persistent code (bytes)
+#ifndef MICROPY_PERSISTENT_CODE_SAVE_FUN
+#define MICROPY_PERSISTENT_CODE_SAVE_FUN (MICROPY_PY_MARSHAL)
+#endif
+
 // Whether generated code can persist independently of the VM/runtime instance
 // This is enabled automatically when needed by other features
 #ifndef MICROPY_PERSISTENT_CODE
@@ -411,6 +416,11 @@
 #define MICROPY_EMIT_RV32 (0)
 #endif
 
+// Whether to enable the RISC-V RV32 inline assembler
+#ifndef MICROPY_EMIT_INLINE_RV32
+#define MICROPY_EMIT_INLINE_RV32 (0)
+#endif
+
 // Convenience definition for whether any native emitter is enabled
 #define MICROPY_EMIT_NATIVE (MICROPY_EMIT_X64 || MICROPY_EMIT_X86 || MICROPY_EMIT_THUMB || MICROPY_EMIT_ARM || MICROPY_EMIT_XTENSA || MICROPY_EMIT_XTENSAWIN || MICROPY_EMIT_RV32 || MICROPY_EMIT_NATIVE_DEBUG)
 
@@ -420,22 +430,10 @@
 #define MICROPY_EMIT_NATIVE_PRELUDE_SEPARATE_FROM_MACHINE_CODE (MICROPY_EMIT_XTENSAWIN)
 
 // Convenience definition for whether any inline assembler emitter is enabled
-#define MICROPY_EMIT_INLINE_ASM (MICROPY_EMIT_INLINE_THUMB || MICROPY_EMIT_INLINE_XTENSA)
+#define MICROPY_EMIT_INLINE_ASM (MICROPY_EMIT_INLINE_THUMB || MICROPY_EMIT_INLINE_XTENSA || MICROPY_EMIT_INLINE_RV32)
 
 // Convenience definition for whether any native or inline assembler emitter is enabled
 #define MICROPY_EMIT_MACHINE_CODE (MICROPY_EMIT_NATIVE || MICROPY_EMIT_INLINE_ASM)
-
-// Whether native relocatable code loaded from .mpy files is explicitly tracked
-// so that the GC cannot reclaim it.  Needed on architectures that allocate
-// executable memory on the MicroPython heap and don't explicitly track this
-// data some other way.
-#ifndef MICROPY_PERSISTENT_CODE_TRACK_RELOC_CODE
-#if !MICROPY_EMIT_MACHINE_CODE || defined(MP_PLAT_ALLOC_EXEC) || defined(MP_PLAT_COMMIT_EXEC)
-#define MICROPY_PERSISTENT_CODE_TRACK_RELOC_CODE (0)
-#else
-#define MICROPY_PERSISTENT_CODE_TRACK_RELOC_CODE (1)
-#endif
-#endif
 
 /*****************************************************************************/
 /* Compiler configuration                                                    */
@@ -1003,6 +1001,11 @@ typedef double mp_float_t;
 #define MICROPY_VFS (0)
 #endif
 
+// Whether to include support for writable filesystems.
+#ifndef MICROPY_VFS_WRITABLE
+#define MICROPY_VFS_WRITABLE (1)
+#endif
+
 // Support for VFS POSIX component, to mount a POSIX filesystem within VFS
 #ifndef MICROPY_VFS_POSIX
 #define MICROPY_VFS_POSIX (0)
@@ -1023,6 +1026,11 @@ typedef double mp_float_t;
 #define MICROPY_VFS_LFS2 (0)
 #endif
 
+// Support for ROMFS.
+#ifndef MICROPY_VFS_ROM
+#define MICROPY_VFS_ROM (0)
+#endif
+
 /*****************************************************************************/
 /* Fine control over Python builtins, classes, modules, etc                  */
 
@@ -1036,6 +1044,11 @@ typedef double mp_float_t;
 // Whether to implement attributes on functions
 #ifndef MICROPY_PY_FUNCTION_ATTRS
 #define MICROPY_PY_FUNCTION_ATTRS (MICROPY_CONFIG_ROM_LEVEL_AT_LEAST_EXTRA_FEATURES)
+#endif
+
+// Whether to implement the __code__ attribute on functions, and function constructor
+#ifndef MICROPY_PY_FUNCTION_ATTRS_CODE
+#define MICROPY_PY_FUNCTION_ATTRS_CODE (MICROPY_CONFIG_ROM_LEVEL_AT_LEAST_FULL_FEATURES)
 #endif
 
 // Whether to support the descriptors __get__, __set__, __delete__
@@ -1124,6 +1137,15 @@ typedef double mp_float_t;
 // Whether to support bytearray object
 #ifndef MICROPY_PY_BUILTINS_BYTEARRAY
 #define MICROPY_PY_BUILTINS_BYTEARRAY (MICROPY_CONFIG_ROM_LEVEL_AT_LEAST_CORE_FEATURES)
+#endif
+
+// Whether to support code objects, and how many features they have
+#define MICROPY_PY_BUILTINS_CODE_NONE       (0)
+#define MICROPY_PY_BUILTINS_CODE_MINIMUM    (1)
+#define MICROPY_PY_BUILTINS_CODE_BASIC      (2)
+#define MICROPY_PY_BUILTINS_CODE_FULL       (3)
+#ifndef MICROPY_PY_BUILTINS_CODE
+#define MICROPY_PY_BUILTINS_CODE            (MICROPY_PY_SYS_SETTRACE ? MICROPY_PY_BUILTINS_CODE_FULL : (MICROPY_PY_FUNCTION_ATTRS_CODE ? MICROPY_PY_BUILTINS_CODE_BASIC : (MICROPY_PY_BUILTINS_COMPILE ? MICROPY_PY_BUILTINS_CODE_MINIMUM : MICROPY_PY_BUILTINS_CODE_NONE)))
 #endif
 
 // Whether to support dict.fromkeys() class method
@@ -1306,6 +1328,11 @@ typedef double mp_float_t;
 #define MICROPY_PY_MICROPYTHON_HEAP_LOCKED (MICROPY_CONFIG_ROM_LEVEL_AT_LEAST_EVERYTHING)
 #endif
 
+// Support for micropython.RingIO()
+#ifndef MICROPY_PY_MICROPYTHON_RINGIO
+#define MICROPY_PY_MICROPYTHON_RINGIO (MICROPY_CONFIG_ROM_LEVEL_AT_LEAST_EXTRA_FEATURES)
+#endif
+
 // Whether to provide "array" module. Note that large chunk of the
 // underlying code is shared with "bytearray" builtin type, so to
 // get real savings, it should be disabled too.
@@ -1353,6 +1380,11 @@ typedef double mp_float_t;
 // Whether to provide the _asdict function for namedtuple
 #ifndef MICROPY_PY_COLLECTIONS_NAMEDTUPLE__ASDICT
 #define MICROPY_PY_COLLECTIONS_NAMEDTUPLE__ASDICT (MICROPY_CONFIG_ROM_LEVEL_AT_LEAST_EVERYTHING)
+#endif
+
+// Whether to provide "marshal" module
+#ifndef MICROPY_PY_MARSHAL
+#define MICROPY_PY_MARSHAL (MICROPY_CONFIG_ROM_LEVEL_AT_LEAST_EVERYTHING)
 #endif
 
 // Whether to provide "math" module
@@ -1621,6 +1653,11 @@ typedef double mp_float_t;
 #define MICROPY_PY_THREAD_GIL_VM_DIVISOR (32)
 #endif
 
+// Is a recursive mutex type in use?
+#ifndef MICROPY_PY_THREAD_RECURSIVE_MUTEX
+#define MICROPY_PY_THREAD_RECURSIVE_MUTEX (MICROPY_PY_THREAD && !MICROPY_PY_THREAD_GIL)
+#endif
+
 // Extended modules
 
 #ifndef MICROPY_PY_ASYNCIO
@@ -1821,6 +1858,11 @@ typedef double mp_float_t;
 #define MICROPY_PY_SSL_FINALISER (MICROPY_ENABLE_FINALISER)
 #endif
 
+// Whether to add a root pointer for the current ssl object
+#ifndef MICROPY_PY_SSL_MBEDTLS_NEED_ACTIVE_CONTEXT
+#define MICROPY_PY_SSL_MBEDTLS_NEED_ACTIVE_CONTEXT (MICROPY_PY_SSL_ECDSA_SIGN_ALT)
+#endif
+
 // Whether to provide the "vfs" module
 #ifndef MICROPY_PY_VFS
 #define MICROPY_PY_VFS (MICROPY_CONFIG_ROM_LEVEL_AT_LEAST_CORE_FEATURES && MICROPY_VFS)
@@ -1987,14 +2029,48 @@ typedef double mp_float_t;
 #define MICROPY_MAKE_POINTER_CALLABLE(p) (p)
 #endif
 
-// If these MP_PLAT_*_EXEC macros are overridden then the memory allocated by them
-// must be somehow reachable for marking by the GC, since the native code
-// generators store pointers to GC managed memory in the code.
-#ifndef MP_PLAT_ALLOC_EXEC
-#define MP_PLAT_ALLOC_EXEC(min_size, ptr, size) do { *ptr = m_new(byte, min_size); *size = min_size; } while (0)
+// Whether native text/BSS/rodata memory loaded from .mpy files is explicitly tracked
+// so that the GC cannot reclaim it.
+//
+// In general a port should let these options have their defaults, but the defaults here
+// can be overridden if needed by defining both MICROPY_PERSISTENT_CODE_TRACK_FUN_DATA
+// and MICROPY_PERSISTENT_CODE_TRACK_BSS_RODATA.
+#ifndef MICROPY_PERSISTENT_CODE_TRACK_FUN_DATA
+#if MICROPY_EMIT_MACHINE_CODE && MICROPY_PERSISTENT_CODE_LOAD
+// Pointer tracking is required when loading native code is enabled.
+#if defined(MP_PLAT_ALLOC_EXEC) || defined(MP_PLAT_COMMIT_EXEC)
+// If a port defined a custom allocator or commit function for native text, then the
+// text does not need to be tracked (its allocation is managed by the port).  But the
+// BSS/rodata must be tracked (if there is any) because if there are any pointers to it
+// in the function data, they aren't traced by the GC.
+#define MICROPY_PERSISTENT_CODE_TRACK_FUN_DATA (0)
+#define MICROPY_PERSISTENT_CODE_TRACK_BSS_RODATA (1)
+#else
+// If a port uses the default allocator (the GC heap) then all native text is allocated
+// on the GC heap.  But it's not guaranteed that a pointer to the head of the block of
+// native text (which may contain multiple native functions) will be retained for the GC
+// to trace.  This is because native functions can start inside the big block of text
+// and so it's possible that the only GC-reachable pointers are pointers inside.
+// Therefore the big block is explicitly tracked. If there is any BSS/rodata memory,
+// then it does not need to be explicitly tracked because a pointer to it is stored into
+// the function text via `mp_native_relocate()`.
+#define MICROPY_PERSISTENT_CODE_TRACK_FUN_DATA (1)
+#define MICROPY_PERSISTENT_CODE_TRACK_BSS_RODATA (0)
+#endif
+#else // MICROPY_EMIT_MACHINE_CODE && MICROPY_PERSISTENT_CODE_LOAD
+// Pointer tracking not needed when loading native code is disabled.
+#define MICROPY_PERSISTENT_CODE_TRACK_FUN_DATA (0)
+#define MICROPY_PERSISTENT_CODE_TRACK_BSS_RODATA (0)
+#endif
 #endif
 
-#ifndef MP_PLAT_FREE_EXEC
+// If these macros are defined then the memory allocated by them does not need to be
+// traced by the GC.  But if they are left undefined then the GC heap will be used as
+// the allocator and the memory must be traced by the GC.  See also above logic for
+// enabling MICROPY_PERSISTENT_CODE_TRACK_FUN_DATA and
+// MICROPY_PERSISTENT_CODE_TRACK_BSS_RODATA.
+#ifndef MP_PLAT_ALLOC_EXEC
+#define MP_PLAT_ALLOC_EXEC(min_size, ptr, size) do { *ptr = m_new(byte, min_size); *size = min_size; } while (0)
 #define MP_PLAT_FREE_EXEC(ptr, size) m_del(byte, ptr, size)
 #endif
 

@@ -132,13 +132,13 @@ static MP_DEFINE_CONST_FUN_OBJ_0(mp_micropython_heap_lock_obj, mp_micropython_he
 
 static mp_obj_t mp_micropython_heap_unlock(void) {
     gc_unlock();
-    return MP_OBJ_NEW_SMALL_INT(MP_STATE_THREAD(gc_lock_depth));
+    return MP_OBJ_NEW_SMALL_INT(MP_STATE_THREAD(gc_lock_depth) >> GC_LOCK_DEPTH_SHIFT);
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(mp_micropython_heap_unlock_obj, mp_micropython_heap_unlock);
 
 #if MICROPY_PY_MICROPYTHON_HEAP_LOCKED
 static mp_obj_t mp_micropython_heap_locked(void) {
-    return MP_OBJ_NEW_SMALL_INT(MP_STATE_THREAD(gc_lock_depth));
+    return MP_OBJ_NEW_SMALL_INT(MP_STATE_THREAD(gc_lock_depth) >> GC_LOCK_DEPTH_SHIFT);
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(mp_micropython_heap_locked_obj, mp_micropython_heap_locked);
 #endif
@@ -199,6 +199,9 @@ static const mp_rom_map_elem_t mp_module_micropython_globals_table[] = {
     #endif
     #if MICROPY_KBD_EXCEPTION
     { MP_ROM_QSTR(MP_QSTR_kbd_intr), MP_ROM_PTR(&mp_micropython_kbd_intr_obj) },
+    #endif
+    #if MICROPY_PY_MICROPYTHON_RINGIO
+    { MP_ROM_QSTR(MP_QSTR_RingIO), MP_ROM_PTR(&mp_type_ringio) },
     #endif
     #if MICROPY_ENABLE_SCHEDULER
     { MP_ROM_QSTR(MP_QSTR_schedule), MP_ROM_PTR(&mp_micropython_schedule_obj) },
