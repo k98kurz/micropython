@@ -1,15 +1,13 @@
 from binascii import crc32
 from collections import namedtuple, deque
 from hashlib import sha256
-from machine import unique_id
+from machine import unique_id, reset
 from math import ceil
 from random import randint
 from struct import pack, unpack
-from time import time
+from time import time, time_ns
 import asyncio
-import espnow
 import micropython
-import network
 
 try:
     from typing import Callable
@@ -35,8 +33,14 @@ else:
     def iscoroutine(c):
         return isinstance(c, GeneratorType)
 
+if hasattr(asyncio, 'sleep_ms'):
+    sleep_ms = asyncio.sleep_ms
+else:
+    sleep_ms = lambda ms: asyncio.sleep(ms/1000)
 
-VERSION = micropython.const(0)
+
+VERSION = micropython.const('0.1.0-dev')
+PROTOCOL_VERSION = micropython.const(0)
 DEBUG = True
 MODEM_SLEEP_MS = micropython.const(90)
 MODEM_WAKE_MS = micropython.const(40)
@@ -44,8 +48,12 @@ MODEM_INTERSECT_INTERVAL = micropython.const(int(0.9 * MODEM_WAKE_MS))
 MODEM_INTERSECT_RTX_TIMES = micropython.const(
     int((MODEM_SLEEP_MS+MODEM_WAKE_MS)/MODEM_INTERSECT_INTERVAL) + 1
 )
+SEQ_SYNC_DELAY_MS = micropython.const(10_000)
 dTree = micropython.const(0)
 dCPL = micropython.const(1)
+
+def time_ms():
+    return int(time_ns()/1_000_000)
 
 def debug(*args):
     if DEBUG:
@@ -93,6 +101,12 @@ def trace(cls_or_fn, prefix: str = ''):
 def clear(d: deque|list):
     while len(d) > 0:
         d.pop()
+
+def enum(**enums):
+    """Enum workaround for micropython. CC BY-SA 4.0
+        https://stackoverflow.com/a/1695250
+    """
+    return type('Enum', (), enums)
 
 
 Field = namedtuple("Field", ["name", "length", "type", "max_length"])
@@ -715,7 +729,7 @@ class Packet:
     @classmethod
     def unpack(cls, data: bytes|bytearray) -> 'Packet':
         version, reserved, schema_id, flags, _ = unpack(f'!BBBB{len(data)-4}s', data)
-        assert version <= VERSION, 'unsupported version encountered'
+        assert version <= PROTOCOL_VERSION, 'unsupported version encountered'
         schema = get_schema(schema_id)
         fields = schema.unpack(data)
         return cls(schema, Flags(flags), fields)
@@ -968,6 +982,9 @@ class Interface:
         self.wake_func = wake_func
         self._hooks = {}
 
+    def __hash__(self) -> int:
+        return hash(self.id)
+
     def configure(self, data: dict) -> None:
         """Call the configure callback, passing self and data."""
         self.call_hook('configure', self, data)
@@ -999,14 +1016,16 @@ class Interface:
         self.call_hook('process')
         if self.receive_func:
             datagram = self.receive_func(self)
-            if datagram:
+            while datagram:
                 self.call_hook('process:receive', datagram)
                 self.inbox.append(datagram)
+                datagram = self.receive_func(self)
         elif self.receive_func_async:
             datagram = await self.receive_func_async(self)
-            if datagram:
+            while datagram:
                 self.call_hook('process:receive_async', datagram)
                 self.inbox.append(datagram)
+                datagram = await self.receive_func_async(self)
 
         if len(self.outbox):
             datagram = self.outbox.popleft()
@@ -1108,6 +1127,10 @@ class Address:
     @classmethod
     def from_str(cls, formatted: str) -> 'Address':
         """Reconstruct an Address from a user-friendly string representation."""
+        formatted = formatted.replace('Address', '')
+        formatted = formatted.replace('(', '')
+        formatted = formatted.replace(')', '')
+        formatted = formatted.replace(' ', '')
         tree_state, addr = formatted.split('-')
         parts = addr.split('::')
         if len(parts) == 1:
@@ -1225,7 +1248,7 @@ class Peer:
         self.addrs = deque([], 2)
         self.timeout = 4
         self.throttle = 0
-        self.last_rx = int(time() * 1000)
+        self.last_rx = time_ms()
         self.queue = deque([], 10)
 
     def set_addr(self, addr: Address):
@@ -1240,7 +1263,7 @@ class Peer:
 
     @property
     def can_tx(self) -> bool:
-        return self.last_rx + 800 > int(time() * 1000)
+        return self.last_rx + 800 > time_ms()
 
 
 # @micropython.native
@@ -1262,10 +1285,13 @@ class Application:
     id: bytes
     receive_func: Callable
     callbacks: dict[str, Callable]
+    params: dict
     _hooks: dict[str, Callable]
 
-    def __init__(self, name: str, description: str, version: int,
-                 receive_func: Callable, callbacks: dict = {}) -> None:
+    def __init__(
+            self, name: str, description: str, version: int,
+            receive_func: Callable, callbacks: dict = {}, params: dict = {}
+        ) -> None:
         self.name = name
         self.description = description
         self.version = version
@@ -1279,6 +1305,7 @@ class Application:
         )).digest()[:16]
         self.receive_func = receive_func
         self.callbacks = callbacks
+        self.params = params
         self._hooks = {}
 
     def add_hook(self, name: str, callback: Callable):
@@ -1358,7 +1385,7 @@ class Cache:
         # if we hit the limit, remove the item that has the lowest expiry
         if len(self.items) >= self.limit:
             self.remove_lowest_expiry()
-        expiry = int(time() * 1000) + ttl
+        expiry = time_ms() + ttl * 1000
         self.items[key] = (expiry, value)
         if expiry < self.lowest_expiry or self.lowest_expiry == -1:
             self.lowest_expiry = expiry
@@ -1366,7 +1393,7 @@ class Cache:
     def get(self, key: bytes) -> object|None:
         if key in self.items:
             pair = self.items[key]
-            if pair[0] < int(time() * 1000):
+            if pair[0] < time_ms():
                 self.items.pop(key)
                 return None
             return pair[1]
@@ -1386,7 +1413,7 @@ class Cache:
     def invalidate_expired(self):
         keys_to_remove = []
         for key, value in self.items.items():
-            if value[0] < int(time() * 1000):
+            if value[0] < time_ms():
                 keys_to_remove.append(key)
         for key in keys_to_remove:
             self.items.pop(key)
@@ -1395,7 +1422,7 @@ class Cache:
 
 # @micropython.native
 class Packager:
-    version: int = 0
+    version: str = VERSION
     interfaces: list[Interface] = []
     seq_id: int = 0
     packet_id: int = 0
@@ -1405,6 +1432,7 @@ class Packager:
     inverse_peers: dict[tuple[bytes, bytes], bytes] = {} # map (mac, intrfc.id): peer_id
     routes: dict[Address, bytes] = {}
     inverse_routes: dict[bytes, deque[Address]] = {}
+    banned: list[bytes] = []
     node_id: bytes = b''
     node_addrs: deque[Address] = deque([], 2)
     apps: dict[bytes, Application] = {}
@@ -1483,15 +1511,17 @@ class Packager:
             send Packages to all such peers.
         """
         cls.call_hook('add_peer', peer_id, interfaces)
+        if peer_id in cls.banned:
+            return
         if peer_id not in cls.peers:
             cls.peers[peer_id] = Peer(peer_id, interfaces)
         peer = cls.peers[peer_id]
         for mac, intrfc in interfaces:
-            if mac not in (i[0] for i in peer.interfaces):
+            if (mac, intrfc) not in peer.interfaces:
                 peer.interfaces.append((mac, intrfc))
             if (mac, intrfc.id) not in cls.inverse_peers:
                 cls.inverse_peers[(mac, intrfc.id)] = peer_id
-        peer.last_rx = int(time()*1000)
+        peer.last_rx = time_ms()
         peer.timeout = 4
 
     @classmethod
@@ -1519,6 +1549,8 @@ class Packager:
             (maintains only one route per tree state).
         """
         cls.call_hook('add_route', node_id, address)
+        if node_id in cls.banned:
+            return
         if node_id in cls.peers:
             addrs = cls.peers[node_id].addrs
             if address not in addrs:
@@ -1545,15 +1577,33 @@ class Packager:
                     cls.inverse_routes[peer_id].append(a)
 
     @classmethod
+    def ban(cls, node_id: bytes):
+        """Bans a node from being a peer or known route."""
+        cls.call_hook('ban', node_id)
+        cls.banned.append(node_id)
+        cls.remove_peer(node_id)
+
+    @classmethod
+    def unban(cls, node_id: bytes):
+        """Unbans a node from being a peer or known route."""
+        cls.call_hook('unban', node_id)
+        cls.banned.remove(node_id)
+
+    @classmethod
     def set_addr(cls, addr: Address):
         """Sets the current tree embedding address for this node,
             preserving the previous address to maintain routability
-            between tree state transitions.
+            between tree state transitions. If the new address shares a
+            tree state with a previous address, the previous address
+            will be removed prior to adding the new address; otherwise,
+            the new address will just be added.
         """
         cls.call_hook('set_addr', addr)
+        addrs = [cls.node_addrs.popleft() for _ in range(len(cls.node_addrs))]
+        for a in addrs:
+            if a.tree_state != addr.tree_state:
+                cls.node_addrs.append(a)
         cls.node_addrs.append(addr)
-        while len(cls.node_addrs) > 2:
-            cls.node_addrs.popleft()
 
     @classmethod
     def broadcast(cls, app_id: bytes, blob: bytes, interface: Interface|None = None) -> bool:
@@ -1612,13 +1662,13 @@ class Packager:
 
     @classmethod
     def next_hop(
-        cls, tree_state: bytes, to_addr: Address, metric: int = dTree
+        cls, to_addr: Address, metric: int = dTree
     ) -> tuple[Peer, Address]|None:
         """Returns the next hop for the given to_addr if one can be
             found for the given tree_state. Returns None if no next
             hop can be found.
         """
-        cls.call_hook('next_hop', to_addr, tree_state, metric)
+        cls.call_hook('next_hop', to_addr, metric)
         if to_addr in cls.routes:
             peer_id = cls.routes[to_addr]
             if peer_id in cls.peers:
@@ -1628,7 +1678,7 @@ class Packager:
         peers: list[tuple[Peer, Address]] = []
         for peer in cls.peers.values():
             for addr in peer.addrs:
-                if addr.tree_state == tree_state:
+                if addr.tree_state == to_addr.tree_state:
                     peers.append((peer, addr))
 
         # bail; should result in an error response
@@ -1644,17 +1694,21 @@ class Packager:
 
     @classmethod
     def send(
-        cls, app_id: bytes, blob: bytes, node_id: bytes, schema: int = None,
-        metric: int = dTree
+        cls, app_id: bytes, blob: bytes, node_id: bytes|None = None,
+        to_addr: Address|None = None, schema: int = None, metric: int = dTree
     ) -> bool:
         """Attempts to send a Package containing the app_id and blob to
             the specified node. Returns True if it can be sent and False
             if it cannot (i.e. if it is not a known peer and there is
             not a known route to the node).
         """
-        cls.call_hook('send', app_id, blob, node_id, schema)
+        cls.call_hook('send', app_id, blob, node_id, to_addr, schema)
+        if node_id is None and to_addr is None:
+            raise TypeError('at least one of node_id or to_addr is required')
         islocal = node_id in cls.peers
-        if not islocal and node_id not in [r for a, r in cls.routes.items()]:
+        if not islocal and \
+            node_id not in [r for a, r in cls.routes.items()] and \
+            to_addr is None and node_id != cls.node_id:
             return False
 
         p = Package.from_blob(app_id, blob).pack()
@@ -1662,19 +1716,19 @@ class Packager:
         if islocal:
             peer = cls.peers[node_id]
         else:
-            # find the address for the given node_id
-            if node_id not in cls.inverse_routes:
-                return False
-            for addr in cls.inverse_routes[node_id]:
-                to_addr = addr
-                break
             if not to_addr:
-                return False
-            next_hop = cls.next_hop(cls.node_addrs[-1].tree_state, to_addr, metric)
+                # find the address for the given node_id
+                if node_id not in cls.inverse_routes:
+                    return False
+                for addr in cls.inverse_routes[node_id]:
+                    to_addr = addr
+                    break
+                if not to_addr:
+                    return False
+            next_hop = cls.next_hop(to_addr, metric)
             if not next_hop:
                 return False
             peer = next_hop[0]
-            addr = next_hop[1]
 
         intrfcs = peer.interfaces
         sids = set(intrfcs[0][1].supported_schemas)
@@ -1691,9 +1745,9 @@ class Packager:
             fields = {
                 k:v for k,v in fields.items()
             }
-            fields['to_addr'] = addr.address
+            fields['to_addr'] = to_addr.address
             fields['from_addr'] = cls.node_addrs[-1].address
-            fields['tree_state'] = addr.tree_state
+            fields['tree_state'] = to_addr.tree_state
         if schema.max_blob > schema.max_body:
             seq = Sequence(schema, cls.seq_id, len(p))
             seq.set_data(p)
@@ -1744,11 +1798,10 @@ class Packager:
 
         if to_addr:
             # unknown node; find next hop
-            next_hop = cls.next_hop(cls.node_addrs[-1].tree_state, to_addr, metric)
+            next_hop = cls.next_hop(to_addr, metric)
             if not next_hop:
                 return (None, None, None)
             peer = next_hop[0]
-            addr = next_hop[1]
             if peer.id in exclude:
                 return (None, None, None)
             intrfcs = peer.interfaces
@@ -1765,7 +1818,7 @@ class Packager:
         """
         cls.call_hook('rns', peer_id, intrfc_id, retries)
         eid = b'rns'+peer_id+intrfc_id
-        now = int(time()*1000)
+        now = time_ms()
         if eid in [e.id for e in cls.new_events]:
             return # do not add a duplicate event
 
@@ -1791,7 +1844,7 @@ class Packager:
             intrfc_id,
             retries=retries-1
         )
-        cls.new_events.append(event)
+        cls.queue_event(event)
         flags = Flags(0)
         flags.rns = True
         intrfc = [i for i in cls.interfaces if i.id == intrfc_id][0]
@@ -1890,6 +1943,8 @@ class Packager:
     def sync_sequence(cls, seq_id: int):
         """Requests retransmission of any missing packets."""
         cls.call_hook('sync_sequence', seq_id)
+        if seq_id not in cls.in_seqs:
+            return
         seq = cls.in_seqs[seq_id]
         if seq.retry <= 0:
             # drop sequence because the originator is not responding to rtx
@@ -1928,7 +1983,7 @@ class Packager:
         seq.retry -= 1
         eid = b'SS' + seq.seq.id.to_bytes(2, 'big')
         cls.queue_event(Event(
-            int(time()+30)*1000,
+            time_ms() + SEQ_SYNC_DELAY_MS,
             eid,
             cls.sync_sequence,
             seq_id
@@ -1944,12 +1999,13 @@ class Packager:
         cls.call_hook('receive', p, intrfc, mac)
         cls.sleepskip.append(True)
         # cls.sleepskip.extend([True for _ in range(MODEM_INTERSECT_RTX_TIMES)])
-        if p.schema.version > cls.version:
+        if p.schema.version > PROTOCOL_VERSION:
             # drop the packet
             return
         src = b'' # source of Packet
         if 'to_addr' in p.fields:
-            if p.fields['to_addr'] not in [a.address for a in cls.node_addrs]:
+            addr = Address(p.fields['tree_state'], p.fields['to_addr'])
+            if addr not in cls.node_addrs:
                 # forward
                 cls.send_packet(p)
                 return
@@ -1998,10 +2054,11 @@ class Packager:
             if seq.seq.add_packet(p):
                 cls.deliver(Package.unpack(seq.seq.data), intrfc, mac)
                 cls.in_seqs.pop(seq_id)
+                cls.cancel_events.append(eid)
             else:
                 # schedule sequence sync event
                 cls.queue_event(Event(
-                    int(time() + 30)*1000,
+                    time_ms() + SEQ_SYNC_DELAY_MS,
                     eid,
                     cls.sync_sequence,
                     seq_id
@@ -2012,7 +2069,7 @@ class Packager:
             peer = cls.peers[src]
             eid = b'rns'+peer.id+intrfc.id
             cls.cancel_events.append(eid)
-            peer.last_rx = int(time()*1000)
+            peer.last_rx = time_ms()
             return
         elif p.flags.rns and len(src):
             # peer sent RNS: send NIA
@@ -2061,11 +2118,14 @@ class Packager:
         """
         cls.call_hook('deliver', p, i, mac)
         if p.half_sha256 != sha256(p.blob).digest()[:16] or p.app_id not in cls.apps:
+            cls.call_hook('deliver:checksum_failed', p, i, mac)
             return False
         try:
+            cls.call_hook('deliver:receive', p, i, mac)
             cls.apps[p.app_id].receive(p.blob, i, mac)
             return True
         except:
+            cls.call_hook('deliver:receive_failed', p, i, mac)
             return False
 
     @classmethod
@@ -2129,7 +2189,7 @@ class Packager:
         # handle scheduled events
         ce = []
         cos = []
-        now = int(time()*1000)
+        now = time_ms()
         for eid, event in cls.schedule.items():
             if now >= event.ts:
                 t = event.handler(*event.args, **event.kwargs)
@@ -2168,12 +2228,12 @@ class Packager:
         cls.call_hook('work', interval_ms, use_modem_sleep, modem_sleep_ms, modem_active_ms)
         cls.running = True
         modem_cycle = 0
-        ts = int(time()*1000)
+        ts = time_ms()
         while cls.running:
             await cls.process()
-            await asyncio.sleep(interval_ms / 1000)
+            await sleep_ms(interval_ms)
             if use_modem_sleep:
-                modem_cycle = int(time()*1000) - ts
+                modem_cycle = time_ms() - ts
                 if modem_cycle > modem_active_ms:
                     modem_cycle = 0
                     if len(cls.sleepskip):
@@ -2184,7 +2244,7 @@ class Packager:
                         lightsleep(modem_sleep_ms)
                         for intrfc in cls.interfaces:
                             intrfc.wake()
-                    ts = int(time()*1000)
+                    ts = time_ms()
 
     @classmethod
     def stop(cls):
@@ -2210,8 +2270,9 @@ InterAppInterface = Interface(
     broadcast_func=lambda d: iai_box.append(d),
 )
 
+Packager.add_interface(InterAppInterface)
 
-now = lambda: int(time()*1000)
+
 BeaconMessage = namedtuple("BeaconMessage", ['op', 'peer_id', 'apps'])
 seen_bm: deque[BeaconMessage] = deque([], 10)
 sent_bm: deque[BeaconMessage] = deque([], 10)
@@ -2300,7 +2361,7 @@ def periodic_beacon(count: int):
         return schedule_beacon()
     Beacon.invoke('broadcast')
     Packager.new_events.append(Event(
-        now() + MODEM_INTERSECT_INTERVAL,
+        time_ms() + Beacon.params['beacon_period'],
         beacon_app_id,
         periodic_beacon,
         count - 1
@@ -2313,10 +2374,10 @@ def schedule_beacon():
     if beacon_app_id+b's' in Packager.schedule:
         return
     Packager.new_events.append(Event(
-        now() + 60_000,
+        time_ms() + Beacon.params['beacon_interval'],
         beacon_app_id+b's',
         periodic_beacon,
-        MODEM_INTERSECT_RTX_TIMES
+        Beacon.params['beacon_count']
     ))
 
 Beacon = Application(
@@ -2331,21 +2392,22 @@ Beacon = Application(
         'get_bmsgs': lambda _, op: get_bmsgs(op),
         'serialize': lambda _, bm: serialize_bm(bm),
         'deserialize': lambda _, blob: deserialize_bm(blob),
-        'start': lambda _: periodic_beacon(MODEM_INTERSECT_RTX_TIMES),
+        # 'start': lambda _: periodic_beacon(MODEM_INTERSECT_RTX_TIMES),
+        'start': lambda _: periodic_beacon(2),
         'get_seen': lambda _: seen_bm,
         'get_sent': lambda _: sent_bm,
+    },
+    params={
+        'beacon_interval': 60_000,
+        'beacon_period': MODEM_INTERSECT_INTERVAL,
+        # 'beacon_count': MODEM_INTERSECT_RTX_TIMES,
+        'beacon_count': 1,
     }
 )
 beacon_app_id = Beacon.id
 
 Packager.add_application(Beacon)
 
-
-def enum(**enums):
-    """Enum workaround for micropython. CC BY-SA 4.0
-        https://stackoverflow.com/a/1695250
-    """
-    return type('Enum', (), enums)
 
 GossipOp = enum(
     REQUEST = 0,
@@ -2359,7 +2421,7 @@ GossipMessage = namedtuple("GossipMessage", ['op', 'topic_id', 'data'])
 # map of topic_id to list of application_ids
 subscriptions: dict[bytes, list[bytes]] = {}
 # buffer of seen message ids (half_sha256)
-seen: deque[bytes] = deque([], 100)
+seen_gm: deque[bytes] = deque([], 100)
 # cache of GossipMessages
 message_cache: Cache = Cache(limit=100)
 # id of this gossip application
@@ -2391,7 +2453,7 @@ def receive_gm(app: Application, blob: bytes, intrfc: Interface, mac: bytes):
         for i in range(0, len(gm.data), 16):
             ids.append(gm.data[i:i+16])
         for id in ids:
-            if message_cache.get(id) is None:
+            if id not in seen_gm:
                 request_gossip_message(id, peer_id)
 
 def publish_gossip(topic_id: bytes, data: bytes):
@@ -2400,12 +2462,12 @@ def publish_gossip(topic_id: bytes, data: bytes):
 
 def deliver_gossip(gm: GossipMessage):
     gm_id = sha256(serialize_gm(gm)).digest()[:16]
-    if gm_id in seen:
+    if gm_id in seen_gm:
         return
-    # add to cache if it is a PUBLISH
-    if gm.op == GossipOp.PUBLISH:
-        seen.append(gm_id)
-        message_cache.add(gm_id, gm, ttl=1000)
+    # add to cache if it is a PUBLISH or RESPOND
+    if gm.op in (GossipOp.PUBLISH, GossipOp.RESPOND):
+        seen_gm.append(gm_id)
+        message_cache.add(gm_id, gm, ttl=300)
     # deliver to subscribed applications
     for app_id in subscriptions.get(gm.topic_id, []):
         app = Packager.apps.get(app_id, None)
@@ -2414,6 +2476,7 @@ def deliver_gossip(gm: GossipMessage):
         app.receive(gm.data, InterAppInterface, gossip_app_id)
     # skip forward/notify if it was a RESPOND and the size is not too large for simple PUBLISH
     if gm.op == GossipOp.RESPOND and len(gm.data) <= 235 - 17 - 32:
+        # i.e. it is not a new message; it is a response to a sync request
         return
     # forward or notify
     if len(gm.data) > 235 - 17 - 32:
@@ -2421,18 +2484,47 @@ def deliver_gossip(gm: GossipMessage):
     else:
         broadcast_gossip(gm)
 
-def broadcast_gossip(gm: GossipMessage):
+def broadcast_gossip(gm: GossipMessage, count: int = 1):
     Packager.broadcast(gossip_app_id, serialize_gm(gm))
+    if count <= 0:
+        return
+    Packager.new_events.append(Event(
+        time_ms() + Gossip.params['echo_delay_ms'],
+        b'b' + sha256(serialize_gm(gm)).digest()[:16],
+        broadcast_gossip,
+        gm,
+        count - 1,
+    ))
 
-def notify_gossip(topic_id: bytes, gm_id: bytes):
+def notify_gossip(topic_id: bytes, gm_id: bytes, count: int = 1):
     gm = GossipMessage(GossipOp.NOTIFY, topic_id, gm_id)
     Packager.broadcast(gossip_app_id, serialize_gm(gm))
+    if count <= 0:
+        return
+    Packager.new_events.append(Event(
+        time_ms() + Gossip.params['echo_delay_ms'],
+        b'n' + sha256(serialize_gm(gm)).digest()[:16],
+        notify_gossip,
+        topic_id,
+        gm_id,
+        count - 1,
+    ))
 
-def request_gossip_message(message_id: bytes, peer_id: bytes):
+def request_gossip_message(message_id: bytes, peer_id: bytes, count: int = 1):
     gm = GossipMessage(GossipOp.REQUEST, message_id, Packager.node_id)
     Packager.send(gossip_app_id, serialize_gm(gm), peer_id)
+    if count <= 0:
+        return
+    Packager.new_events.append(Event(
+        time_ms() + Gossip.params['echo_delay_ms'],
+        b'q' + sha256(serialize_gm(gm)).digest()[:16],
+        request_gossip_message,
+        message_id,
+        peer_id,
+        count - 1,
+    ))
 
-def respond_gossip_request(peer_id: bytes, gm_id: bytes):
+def respond_gossip_request(peer_id: bytes, gm_id: bytes, count: int = 1):
     gm: GossipMessage|None = message_cache.get(gm_id)
     if gm is None:
         return
@@ -2443,6 +2535,14 @@ def respond_gossip_request(peer_id: bytes, gm_id: bytes):
         # was a request following message ids; modify the op so it is not forwarded
         new_gm = GossipMessage(GossipOp.RESPOND, gm.topic_id, gm.data)
         Packager.send(gossip_app_id, serialize_gm(new_gm), peer_id)
+    if count <= 0:
+        return
+    Packager.new_events.append(Event(
+        time_ms() + Gossip.params['echo_delay_ms'],
+        b'r' + sha256(serialize_gm(gm)).digest()[:16],
+        respond_gossip_request,
+        peer_id, gm_id, count - 1,
+    ))
 
 def request_gossip_ids(topic_id: bytes, peer_id: bytes):
     gm = GossipMessage(GossipOp.REQUEST_IDS, topic_id, Packager.node_id)
@@ -2457,14 +2557,18 @@ def schedule_request_gossip_ids(topic_id: bytes, peer_id: bytes):
     ))
 
 def respond_gossip_ids(peer_id: bytes, topic_id: bytes):
-    ids = list(message_cache.items.keys())
+    ids = []
+    for gm_id, (_, gm) in message_cache.items.items():
+        if gm.topic_id == topic_id:
+            ids.append(gm_id)
     gm = GossipMessage(GossipOp.RESPOND_IDS, topic_id, b''.join(ids))
     Packager.send(gossip_app_id, serialize_gm(gm), peer_id)
 
 def subscribe_gossip(topic_id: bytes, app_id: bytes):
     if topic_id not in subscriptions:
         subscriptions[topic_id] = []
-    subscriptions[topic_id].append(app_id)
+    if app_id not in subscriptions[topic_id]:
+        subscriptions[topic_id].append(app_id)
 
 def unsubscribe_gossip(topic_id: bytes, app_id: bytes):
     if topic_id in subscriptions and app_id in subscriptions[topic_id]:
@@ -2480,27 +2584,33 @@ def add_peer_callback(_, pid: bytes, intrfcs: list[tuple[bytes, Interface]]):
 def sync_all_peers():
     for pid in Packager.peers:
         for topic_id in subscriptions:
-            request_gossip_ids(topic_id, pid)
+            Gossip.invoke('request_ids', topic_id, pid)
 
     Packager.new_events.append(Event(
-        int(time() * 1000) + 60_000,
+        time_ms() + Gossip.params['schedule_delay']*1000,
         Gossip.id,
         sync_all_peers,
     ))
-
 
 def start():
     Packager.add_hook('add_peer', add_peer_callback)
     if Gossip.id in Packager.schedule:
         return
     Packager.new_events.append(Event(
-        0,
+        time_ms() + Gossip.params['start_delay']*1000,
         Gossip.id,
         sync_all_peers,
     ))
 
 def stop():
     Packager.remove_hook('add_peer', add_peer_callback)
+
+def get_messages(topic_id: bytes):
+    res = []
+    for _, val in message_cache.items.items():
+        if val[1].topic_id == topic_id:
+            res.append(val[1])
+    return res
 
 
 Gossip = Application(
@@ -2518,25 +2628,26 @@ Gossip = Application(
         'subscribe': lambda _, topic_id, app_id: subscribe_gossip(topic_id, app_id),
         'unsubscribe': lambda _, topic_id, app_id: unsubscribe_gossip(topic_id, app_id),
         'deliver_gossip': lambda _, gm: deliver_gossip(gm),
+        'sync': lambda _: sync_all_peers(),
         'start': lambda _: start(),
         'stop': lambda _: stop(),
-        'get_seen': lambda _: seen,
+        'get_seen': lambda _: seen_gm,
         'get_subscriptions': lambda _: subscriptions,
-        'get_message_cache': lambda _: message_cache,
+        'get_cache': lambda _: message_cache,
+        'get_messages': lambda _, topic_id: get_messages(topic_id),
         'serialize_gm': lambda _, gm: serialize_gm(gm),
         'deserialize_gm': lambda _, blob: deserialize_gm(blob),
+    },
+    params={
+        'start_delay': 10,
+        'schedule_delay': 20,
+        'echo_delay_ms': 20,
     }
 )
 gossip_app_id = Gossip.id
 
 Packager.add_application(Gossip)
 
-
-def enum(**enums):
-    """Enum workaround for micropython. CC BY-SA 4.0
-        https://stackoverflow.com/a/1695250
-    """
-    return type('Enum', (), enums)
 
 TreeOp = enum(
     SEND = 0,
@@ -2554,8 +2665,8 @@ root_id_targets = (
     b'5678' * 8,
     b'8765' * 8,
 )
-now = lambda: int(time()*1000)
-TreeMessage = namedtuple("TreeMessage", ['op', 'claim', 'address', 'node_id'])
+now = lambda: int(time_ns() / 1_000_000)
+TreeMessage = namedtuple("TreeMessage", ['op', 'ts', 'age', 'claim', 'address', 'node_id'])
 seen_tm: deque[TreeMessage] = deque([], 10)
 tree_app_id = b''
 gossip_app_id = bytes.fromhex('849969c1f22797d66f5a94db2afe634a')
@@ -2563,12 +2674,16 @@ tree_maintenance_rounds = 0
 
 current_children: dict[bytes, int] = {} # map of child peer ids to coordinates
 current_parent: bytes = b''
+tree_last_ts = int(time())
 # tuple of (claim, dTree from root, peer_id)
 known_claims: deque[tuple[bytes, int, bytes]] = deque([], 10)
 
 # elect self as initial root
 current_best_root_id = Packager.node_id
 Packager.set_addr(Address(tree_state(Packager.node_id), coords=[]))
+
+tree_age = lambda: int(time()) - tree_last_ts
+is_root = lambda: Packager.node_id == current_best_root_id
 
 def xor(b1: bytes, b2: bytes) -> bytes:
     """XOR two equal-length byte strings together."""
@@ -2583,11 +2698,11 @@ def claim_score(node_id: bytes, overlay_idx: int = 0) -> int:
     return int.from_bytes(xor(node_id, root_id_targets[overlay_idx]), 'big')
 
 def serialize_tm(tmsg: TreeMessage):
-    return pack('!B32s16s32s', tmsg.op, tmsg.claim, tmsg.address, tmsg.node_id)
+    return pack('!BQB32s16s32s', tmsg.op, tmsg.ts, tmsg.age, tmsg.claim, tmsg.address, tmsg.node_id)
 
 def deserialize_tm(blob: bytes) -> TreeMessage:
-    op, claim, address, node_id = unpack('!B32s16s32s', blob)
-    return TreeMessage(op, claim, address, node_id)
+    op, ts, age, claim, address, node_id = unpack('!BQB32s16s32s', blob)
+    return TreeMessage(op, ts, age, claim, address, node_id)
 
 def lwst_avlbl_coord() -> int|None:
     vals = set(current_children.values())
@@ -2602,12 +2717,12 @@ def remove_peer(_, pid: bytes):
         del current_children[pid]
     # remove the peer from the known claims
     claims = [known_claims.popleft() for _ in range(len(known_claims))]
-    for claim, dTree, peer_id in claims:
+    for claim, ts, dTree, peer_id in claims:
         if peer_id != pid:
-            known_claims.append((claim, dTree, peer_id))
+            known_claims.append((claim, ts, dTree, peer_id))
 
 def receive_tm(app: Application, blob: bytes, intrfc: Interface, mac: bytes):
-    global current_best_root_id, current_parent
+    global current_best_root_id, current_parent, tree_last_ts
     tmsg = deserialize_tm(blob)
     seen_tm.append(tmsg)
     peer_id = Packager.inverse_peers.get((mac, intrfc.id), None)
@@ -2622,21 +2737,21 @@ def receive_tm(app: Application, blob: bytes, intrfc: Interface, mac: bytes):
             if tmsg.node_id != peer_id:
                 # gossip message for app/service discovery; do not respond
                 return
-        if their_score < our_score:
+        if tmsg.age < SpanningTree.params['max_tree_age']:
             # add the claim to the known claims
             addr = Address(tree_state(tmsg.claim), address=tmsg.address)
             root = Address(tree_state(tmsg.claim), coords=[])
-            known_claims.append((tmsg.claim, addr.dTree(root, addr), peer_id))
-        elif our_score < their_score:
+            known_claims.append((tmsg.claim, int(time())-tmsg.age, addr.dTree(root, addr), peer_id))
+        if our_score < their_score:
             # we have a better claim, so respond with it
             SpanningTree.invoke('respond', peer_id)
     elif tmsg.op == TreeOp.RESPOND:
         # received a response to a periodic broadcast
-        if their_score < our_score:
+        if tmsg.age < SpanningTree.params['max_tree_age']:
             # add the claim to the known claims
             addr = Address(tree_state(tmsg.claim), address=tmsg.address)
             root = Address(tree_state(tmsg.claim), coords=[])
-            known_claims.append((tmsg.claim, addr.dTree(root, addr), peer_id))
+            known_claims.append((tmsg.claim, int(time())-tmsg.age, addr.dTree(root, addr), peer_id))
     elif tmsg.op == TreeOp.REQUEST_ADDRESS_ASSIGNMENT:
         # received an address assignment request
         if tree_state(tmsg.claim) == Packager.node_addrs[-1].tree_state:
@@ -2661,9 +2776,15 @@ def receive_tm(app: Application, blob: bytes, intrfc: Interface, mac: bytes):
             # we have a better claim, so respond with it
             SpanningTree.invoke('respond', peer_id)
 
+    # update the tree last ts if the message is from the parent
+    if tmsg.node_id == current_parent:
+        tree_last_ts = int(time()) - tmsg.age
+
 def broadcast_tree_message():
     tmsg = TreeMessage(
         TreeOp.SEND,
+        now(),
+        tree_age(),
         current_best_root_id,
         Packager.node_addrs[-1].address,
         Packager.node_id
@@ -2673,6 +2794,8 @@ def broadcast_tree_message():
 def send_tree_message(pid: bytes):
     tmsg = TreeMessage(
         TreeOp.SEND,
+        now(),
+        tree_age(),
         current_best_root_id,
         Packager.node_addrs[-1].address,
         Packager.node_id
@@ -2682,6 +2805,8 @@ def send_tree_message(pid: bytes):
 def respond_tree_message(pid: bytes):
     tmsg = TreeMessage(
         TreeOp.RESPOND,
+        now(),
+        tree_age(),
         current_best_root_id,
         Packager.node_addrs[-1].address,
         Packager.node_id
@@ -2691,6 +2816,8 @@ def respond_tree_message(pid: bytes):
 def request_address_assignment(pid: bytes, claim: bytes):
     tmsg = TreeMessage(
         TreeOp.REQUEST_ADDRESS_ASSIGNMENT,
+        now(),
+        0,
         claim,
         b'\x00' * 16,
         Packager.node_id
@@ -2701,6 +2828,8 @@ def assign_address(pid: bytes, coords: list[int]):
     addr = Address(tree_state(current_best_root_id), coords=coords)
     tmsg = TreeMessage(
         TreeOp.ASSIGN_ADDRESS,
+        now(),
+        tree_age(),
         current_best_root_id,
         addr.address,
         Packager.node_id
@@ -2713,7 +2842,7 @@ def periodic_tree_message(count: int):
         return schedule_tree_maintenance()
     SpanningTree.invoke('broadcast')
     Packager.new_events.append(Event(
-        now() + MODEM_INTERSECT_INTERVAL,
+        now() + SpanningTree.params['broadcast_interval'],
         tree_app_id,
         periodic_tree_message,
         count - 1
@@ -2724,6 +2853,8 @@ def send_gossip_tree_message(addr: Address|None = None):
     if Gossip is not None:
         tm = TreeMessage(
             TreeOp.SEND,
+            now(),
+            tree_age(),
             current_best_root_id,
             addr.address if addr is not None else Packager.node_addrs[-1].address,
             Packager.node_id
@@ -2737,32 +2868,41 @@ def maintain_tree():
         3) begin the periodic_tree_message event; 4) send a gossip
         message every 5th maintenance event.
     """
-    global current_best_root_id, current_parent, current_children, tree_maintenance_rounds
+    global current_best_root_id, current_parent, current_children
+    global tree_maintenance_rounds, tree_last_ts
 
-    # check if parent has disconnected
-    if current_parent != b'':
-        if current_parent not in Packager.peers:
-            # parent has disconnected, reset the local state
-            current_best_root_id = Packager.node_id
-            current_parent = b''
-            current_children.clear()
-            Packager.set_addr(Address(tree_state(Packager.node_id), coords=[]))
+    # check if tree is too old
+    if tree_age() > SpanningTree.params['max_tree_age']:
+        # reset the local state
+        current_best_root_id = Packager.node_id
+        current_parent = b''
+        current_children.clear()
+        Packager.set_addr(Address(tree_state(Packager.node_id), coords=[]))
+
+    # remove expired claims
+    claims = [known_claims.pop() for _ in range(len(known_claims))]
+    for claim, ts, dTree, peer_id in claims:
+        if int(time()) - ts < SpanningTree.params['max_tree_age']:
+            known_claims.append((claim, ts, dTree, peer_id))
 
     # check if there is no parent and there are known claims
     if current_parent == b'' and len(known_claims) > 0:
         # get the best known claim (and shortest distance from root)
         claims = list(known_claims)
         claims.sort(key=lambda t: claim_score(t[0]) + t[1])
-        best_claim, _, peer_id = claims[0]
+        best_claim, ts, _, peer_id = claims[0]
         if claim_score(best_claim) < claim_score(current_best_root_id):
             # request an address assignment from the best claim
             SpanningTree.invoke('request_address_assignment', peer_id, best_claim)
         else:
             # we have the best claim, so begin broadcasting it
-            periodic_tree_message(MODEM_INTERSECT_RTX_TIMES)
+            tree_last_ts = int(time())
+            periodic_tree_message(SpanningTree.params['broadcast_count'])
     else:
         # begin broadcasting
-        periodic_tree_message(MODEM_INTERSECT_RTX_TIMES)
+        if current_best_root_id == Packager.node_id:
+            tree_last_ts = int(time())
+        periodic_tree_message(SpanningTree.params['broadcast_count'])
 
     # tree_maintenance_rounds += 1
     # if tree_maintenance_rounds >= 5:
@@ -2774,10 +2914,8 @@ def maintain_tree():
 
 def schedule_tree_maintenance():
     """Schedules the tree maintenance event for 60s in the future."""
-    if tree_app_id+b's' in Packager.schedule:
-        return
     Packager.new_events.append(Event(
-        now() + 60_000,
+        now() + SpanningTree.params['tree_maintenance_delay'],
         tree_app_id+b's',
         maintain_tree,
     ))
@@ -2785,23 +2923,29 @@ def schedule_tree_maintenance():
 def set_addr_gossip_callback(_, addr: Address):
     send_gossip_tree_message(addr)
 
-def schedule_start():
-    """Schedules the app to start broadcasting with a random delay up to 30s."""
+def schedule_start(pub = None, sub = None):
+    """Schedules the app to start broadcasting with a random delay up to
+        params['max_start_delay'] ms.
+    """
+    if type(pub) is bool:
+        SpanningTree.params['pub'] = pub
+    if type(sub) is bool:
+        SpanningTree.params['sub'] = sub
     global current_best_root_id
-    if tree_app_id+b's' in Packager.schedule:
-        return
     Packager.add_hook('remove_peer', remove_peer)
     current_best_root_id = Packager.node_id
     Packager.set_addr(Address(tree_state(Packager.node_id), coords=[]))
     Packager.new_events.append(Event(
-        now() + randint(0, 30) * 1000,
+        now() + randint(0, SpanningTree.params['max_start_delay']),
         tree_app_id + b's',
         maintain_tree,
     ))
     Gossip = Packager.apps.get(gossip_app_id, None)
-    Packager.add_hook('set_addr', set_addr_gossip_callback)
     if Gossip is not None:
-        Gossip.invoke('subscribe', tree_app_id, tree_app_id)
+        if SpanningTree.params.get('pub'):
+            Packager.add_hook('set_addr', set_addr_gossip_callback)
+        if SpanningTree.params.get('sub'):
+            Gossip.invoke('subscribe', tree_app_id, tree_app_id)
 
 def stop():
     """Cancels all events and removes all hooks."""
@@ -2829,7 +2973,7 @@ SpanningTree = Application(
         'schedule_tree_maintenance': lambda _: schedule_tree_maintenance(),
         'serialize': lambda _, tm: serialize_tm(tm),
         'deserialize': lambda _, blob: deserialize_tm(blob),
-        'start': lambda _: schedule_start(),
+        'start': lambda _, **kwargs: schedule_start(**kwargs),
         'stop': lambda _: stop(),
         'claim_score': lambda _, claim: claim_score(claim),
         'get_known_claims': lambda _: known_claims,
@@ -2838,18 +2982,22 @@ SpanningTree = Application(
         'get_current_best_root_id': lambda _: current_best_root_id,
         'send_gossip_tree_message': lambda _: send_gossip_tree_message(),
         'get_seen': lambda _: seen_tm,
+    },
+    params={
+        'max_start_delay': 10_000,
+        'tree_maintenance_delay': 20_000,
+        'max_tree_age': 60,
+        # 'broadcast_count': MODEM_INTERSECT_RTX_TIMES,
+        'broadcast_count': 1,
+        'broadcast_interval': MODEM_INTERSECT_INTERVAL,
+        'pub': True,
+        'sub': False
     }
 )
 tree_app_id = SpanningTree.id
 
 Packager.add_application(SpanningTree)
 
-
-def enum(**enums):
-    """Enum workaround for micropython. CC BY-SA 4.0
-        https://stackoverflow.com/a/1695250
-    """
-    return type('Enum', (), enums)
 
 PingOp = enum(
     REQUEST = 0,
@@ -2868,7 +3016,7 @@ gossip_app_id = bytes.fromhex('849969c1f22797d66f5a94db2afe634a')
 
 def serialize_pm(pm: PingMessage) -> bytes:
     return pack(
-        '!BBBIIIB16s32s',
+        '!BBBQQQB16s32s',
         pm.op,
         pm.nonce,
         pm.metric,
@@ -2881,13 +3029,13 @@ def serialize_pm(pm: PingMessage) -> bytes:
     )
 
 def deserialize_pm(blob: bytes) -> PingMessage:
-    return PingMessage(*unpack('!BBBIIIB16s32s', blob))
+    return PingMessage(*unpack('!BBBQQQB16s32s', blob))
 
 def receive_pm(app: Application, blob: bytes, intrfc: Interface, mac: bytes):
     pm = deserialize_pm(blob)
     if pm.op == PingOp.REQUEST:
-        if pm.node_id is not None and pm.node_id != Packager.node_id:
-            Packager.add_route(pm.node_id, Address(pm.tree_state, address=pm.address))
+        # if pm.node_id is not None and pm.node_id != Packager.node_id:
+            # Packager.add_route(pm.node_id, Address(pm.tree_state, address=pm.address))
         Ping.invoke('respond', pm)
     elif pm.op == PingOp.RESPOND:
         Ping.invoke('response_received', pm)
@@ -2897,26 +3045,37 @@ def receive_pm(app: Application, blob: bytes, intrfc: Interface, mac: bytes):
         Ping.invoke('gossip_response_received', pm)
 
 def ping_request(
-        node_id: bytes|str, metric: int = dTree, nonce: int|None = None
+        nid_or_addr: bytes|Address, metric: int = dTree,
+        nonce: int|None = None, callback: Callable|None = None
     ) -> bool:
-    """Send a ping request to the given node id. Returns False if it
-        cannot be sent (no route to the node or no local address).
+    """Send a ping request to the given node id or addr. Returns False
+        if it cannot be sent (no route to the node or no local address).
     """
     if len(Packager.node_addrs) == 0:
         return False
-    node_id = bytes.fromhex(node_id) if type(node_id) == str else node_id
+    if type(nid_or_addr) is Address:
+        addr = nid_or_addr
+        node_id = None
+    else:
+        addr = None
+        node_id = nid_or_addr
     pm = PingMessage(
         PingOp.REQUEST,
         nonce if nonce is not None else randint(0, 255),
         metric,
-        int(time()),
+        time_ms(),
         0,
         0,
         Packager.node_addrs[-1].tree_state,
         Packager.node_addrs[-1].address,
         Packager.node_id
     )
-    return Packager.send(Ping.id, serialize_pm(pm), node_id, metric=metric)
+    res = Packager.send(
+        Ping.id, serialize_pm(pm), node_id=node_id, to_addr=addr, metric=metric
+    )
+    if callback is not None:
+        callback(f'ping request to {nid_or_addr} ' + ('sent' if res else 'failed to send'))
+    return res
 
 def ping_respond(pm: PingMessage):
     """Send a ping response using the information in the ping message."""
@@ -2925,13 +3084,16 @@ def ping_respond(pm: PingMessage):
         pm.nonce,
         pm.metric,
         pm.ts1,
-        int(time()),
+        time_ms(),
         0,
         pm.tree_state,
         pm.address,
         pm.node_id
     )
-    return Packager.send(Ping.id, serialize_pm(pm), pm.node_id, metric=pm.metric)
+    return Packager.send(
+        Ping.id, serialize_pm(pm), node_id=pm.node_id,
+        to_addr=Address(pm.tree_state, pm.address), metric=pm.metric
+    )
 
 def ping_response_received(pm: PingMessage):
     ping_responses.append(PingMessage(
@@ -2940,13 +3102,16 @@ def ping_response_received(pm: PingMessage):
         pm.metric,
         pm.ts1,
         pm.ts2,
-        int(time()),
+        time_ms(),
         pm.tree_state,
         pm.address,
         pm.node_id
     ))
 
-def ping_gossip_request(node_id: bytes|str, nonce: int|None = None) -> bool:
+def ping_gossip_request(
+        node_id: bytes|str, nonce: int|None = None,
+        callback: Callable|None = None
+    ) -> bool:
     """Send a gossip request to the given node id. Returns False if the
         gossip application is not found or if the local node has no
         address.
@@ -2959,7 +3124,7 @@ def ping_gossip_request(node_id: bytes|str, nonce: int|None = None) -> bool:
         PingOp.GOSSIP_REQUEST,
         nonce if nonce is not None else randint(0, 255),
         0,
-        int(time()),
+        time_ms(),
         0,
         0,
         Packager.node_addrs[-1].tree_state,
@@ -2968,6 +3133,8 @@ def ping_gossip_request(node_id: bytes|str, nonce: int|None = None) -> bool:
     )
     topic_id = sha256(Ping.id + node_id).digest()[:16]
     Gossip.invoke('publish', topic_id, serialize_pm(pm))
+    if callback is not None:
+        callback('gossip ping request sent')
     return True
 
 def ping_gossip_respond(pm: PingMessage) -> bool:
@@ -2980,7 +3147,7 @@ def ping_gossip_respond(pm: PingMessage) -> bool:
         pm.nonce,
         pm.metric,
         pm.ts1,
-        int(time()),
+        time_ms(),
         0,
         pm.tree_state,
         pm.address,
@@ -2997,7 +3164,7 @@ def ping_gossip_response_received(pm: PingMessage):
         pm.metric,
         pm.ts1,
         pm.ts2,
-        int(time()),
+        time_ms(),
         pm.tree_state,
         pm.address,
         pm.node_id
@@ -3010,8 +3177,9 @@ def ping_list_routes():
         print(f'\t{node_id.hex()}: {addr.coords} {addr.address.hex()}')
 
 def report_ping_test(
-        nonce: int, mode: str, remote_id: bytes|str,
-        remote_addr: Address|None = None, callback: Callable|None = None
+        nonce: int, mode: str, expected_count: int,
+        remote_id_or_addr: bytes|Address,
+        callback: Callable|None = None
     ) -> dict:
     """Generate a report of the ping test results."""
     # take all relevant pms, then put the rest back
@@ -3026,22 +3194,28 @@ def report_ping_test(
         else:
             ping_responses.append(pm)
     # generate report
+    if type(remote_id_or_addr) is bytes:
+        remote = remote_id_or_addr.hex()
+    else:
+        remote = remote_id_or_addr
     count = len(relevant_pms)
     if count == 0:
         report = {
             'error': 'no responses',
-            'remote_id': remote_id if type(remote_id) == str else remote_id.hex(),
-            'remote_addr': remote_addr,
+            'remote': remote,
             'mode': mode,
+            'expected_count': expected_count,
+            'success_rate': '0%',
         }
         if callback is not None:
             callback(report)
         return report
     report = {
         'mode': mode,
-        'remote_id': remote_id if type(remote_id) == str else remote_id.hex(),
-        'remote_addr': remote_addr,
+        'remote': remote,
         'count': count,
+        'expected_count': expected_count,
+        'success_rate': f"{int(count / expected_count * 100)}%",
         'there': {
             'min': 10**9,
             'max': 0,
@@ -3088,7 +3262,7 @@ def report_ping_test(
     return report
 
 def run_ping_test(
-        node_id: bytes|str, count: int = 4, timeout: int = 30,
+        node_id: bytes|None = None, count: int = 4, timeout: int = 5,
         addr: Address|None = None, metric: int = dTree,
         callback: Callable|None = None
     ):
@@ -3096,35 +3270,36 @@ def run_ping_test(
         delays calculated by multiplying the index by the timeout. Also
         schedules generation of a report after timeout * count seconds.
     """
-    node_id = bytes.fromhex(node_id) if type(node_id) == str else node_id
-    topic_id = sha256(Ping.id + node_id).digest()[:16]
+    if callback is not None:
+        callback('ping test started')
+    topic_id = sha256(Ping.id + (node_id or addr.address)).digest()[:16]
     topic_id += PingOp.REQUEST.to_bytes(1, 'big')
     nonce = randint(0, 255)
-    now = int(time())*1000
+    now = time_ms()
     addr = addr if addr is not None else Packager.inverse_routes.get(node_id, [None])[-1]
     for i in range(count):
         Packager.new_events.append(Event(
-            now + timeout * i * 1000,
+            now + i * 1000,
             topic_id + i.to_bytes(1, 'big'),
             ping_request,
-            node_id,
+            node_id or addr,
             metric,
             nonce,
+            callback,
         ))
     Packager.new_events.append(Event(
-        now + timeout * count * 1000,
+        now + (timeout + count) * 1000,
         topic_id + count.to_bytes(1, 'big'),
         report_ping_test,
         nonce,
         'routed dTree' if metric == dTree else 'routed dCPL' if metric == dCPL else 'unknown metric',
-        node_id,
-        addr,
+        count,
+        node_id or addr,
         callback,
     ))
 
 def run_gossip_ping_test(
-        node_id: bytes|str, count: int = 4, timeout: int = 60,
-        addr: Address|None = None,
+        node_id: bytes|str, count: int = 4, timeout: int = 5,
         callback: Callable|None = None
     ):
     """Ping a node count times through Gossip, scheduling a series of
@@ -3132,27 +3307,30 @@ def run_gossip_ping_test(
         timeout. Also schedules generation of a report after timeout *
         count seconds.
     """
+    if callback is not None:
+        callback('gossip ping test started')
     node_id = bytes.fromhex(node_id) if type(node_id) == str else node_id
     topic_id = sha256(Ping.id + node_id).digest()[:16]
     topic_id += PingOp.GOSSIP_REQUEST.to_bytes(1, 'big')
     nonce = randint(0, 255)
-    now = int(time())*1000
+    now = time_ms()
     for i in range(count):
         Packager.new_events.append(Event(
-            now + timeout * i * 1000,
+            now + i * 1000,
             topic_id + i.to_bytes(1, 'big'),
             ping_gossip_request,
             node_id,
             nonce,
+            callback,
         ))
     Packager.new_events.append(Event(
-        now + timeout * count * 1000,
+        now + (timeout + count) * 1000,
         topic_id + count.to_bytes(1, 'big'),
         report_ping_test,
         nonce,
         'gossip',
+        count,
         node_id,
-        addr,
         callback,
     ))
 
@@ -3197,6 +3375,243 @@ Ping = Application(
 )
 
 Packager.add_application(Ping)
+# save_imports
+import json
+
+
+DebugOp = enum(
+    REQUEST_NODE_INFO = 0,
+    REQUEST_PEER_LIST = 1,
+    REQUEST_ROUTES = 2,
+    REQUEST_NEXT_HOP = 3,
+    RESPOND_NODE_INFO = 100,
+    RESPOND_PEER_LIST = 101,
+    RESPOND_ROUTES = 102,
+    RESPOND_NEXT_HOP = 103,
+    OK = 200,
+    REQUIRE_REFLECT = 254,
+    REQUIRE_RESET = 255,
+)
+_inverse_op = {
+    DebugOp.REQUEST_NODE_INFO: 'REQUEST_NODE_INFO',
+    DebugOp.REQUEST_PEER_LIST: 'REQUEST_PEER_LIST',
+    DebugOp.REQUEST_ROUTES: 'REQUEST_ROUTES',
+    DebugOp.REQUEST_NEXT_HOP: 'REQUEST_NEXT_HOP',
+    DebugOp.RESPOND_NODE_INFO: 'RESPOND_NODE_INFO',
+    DebugOp.RESPOND_PEER_LIST: 'RESPOND_PEER_LIST',
+    DebugOp.RESPOND_ROUTES: 'RESPOND_ROUTES',
+    DebugOp.RESPOND_NEXT_HOP: 'RESPOND_NEXT_HOP',
+    DebugOp.OK: 'OK',
+    DebugOp.REQUIRE_REFLECT: 'REQUIRE_REFLECT',
+    DebugOp.REQUIRE_RESET: 'REQUIRE_RESET',
+}
+DebugMessage = namedtuple('DebugMessage', ['op', 'ts', 'nonce', 'from_id', 'data'])
+
+gossip_app_id = bytes.fromhex('849969c1f22797d66f5a94db2afe634a')
+seen_results: deque[dict] = deque([], 10)
+def debug_auth_check(data: bytes):
+    auth_hash1 = sha256(data).digest()[:16]
+    auth_hash2 = sha256(data[1:]).digest()[:16]
+    expected = bytes.fromhex('32549bff6d8404c4d121b589f4d24ac6')
+    return auth_hash1 == expected or auth_hash2 == expected
+
+def serialize_dm(dm: DebugMessage):
+    return pack(f'!BIH32s{len(dm.data)}s', dm.op, dm.ts, dm.nonce, dm.from_id, dm.data)
+
+def deserialize_dm(blob: bytes) -> DebugMessage:
+    return DebugMessage(*unpack(f'!BIH32s{len(blob) - 39}s', blob))
+
+def receive_debug(app: Application, blob: bytes, intrfc: Interface, mac: bytes):
+    dm = deserialize_dm(blob)
+    if dm.op == DebugOp.REQUEST_NODE_INFO:
+        DebugApp.invoke('handle_request_node_info', dm)
+    elif dm.op == DebugOp.REQUEST_PEER_LIST:
+        DebugApp.invoke('handle_request_peer_list', dm)
+    elif dm.op == DebugOp.REQUEST_ROUTES:
+        DebugApp.invoke('handle_request_routes', dm)
+    elif dm.op == DebugOp.REQUEST_NEXT_HOP:
+        DebugApp.invoke('handle_request_next_hop', dm)
+    elif dm.op == DebugOp.RESPOND_NODE_INFO:
+        DebugApp.invoke('handle_response', dm)
+    elif dm.op == DebugOp.RESPOND_PEER_LIST:
+        DebugApp.invoke('handle_response', dm)
+    elif dm.op == DebugOp.RESPOND_ROUTES:
+        DebugApp.invoke('handle_response', dm)
+    elif dm.op == DebugOp.RESPOND_NEXT_HOP:
+        DebugApp.invoke('handle_response', dm)
+    elif dm.op == DebugOp.OK:
+        DebugApp.invoke('handle_response', dm)
+    else:
+        DebugApp.invoke('handle_require', dm)
+
+def handle_request_node_info(dm: DebugMessage):
+    Gossip = Packager.apps.get(gossip_app_id, None)
+    if Gossip is None:
+        return
+    info = {
+        'node_id': Packager.node_id.hex(),
+        'node_addrs': [str(addr) for addr in Packager.node_addrs],
+        'apps': [app.id.hex() for app in Packager.apps.values()],
+    }
+    topic_id = sha256(DebugApp.id + dm.from_id).digest()[:16]
+    new_dm = DebugMessage(
+        DebugOp.RESPOND_NODE_INFO, int(time()), dm.nonce, Packager.node_id, json.dumps(info).encode()
+    )
+    Gossip.invoke('publish', topic_id, serialize_dm(new_dm))
+
+def handle_request_peer_list(dm: DebugMessage):
+    Gossip = Packager.apps.get(gossip_app_id, None)
+    if Gossip is None:
+        return
+    info = {
+        'node_id': Packager.node_id.hex(),
+        'peers': {
+            pid.hex(): [str(addr) for addr in peer.addrs]
+            for pid, peer in Packager.peers.items()
+        },
+    }
+    topic_id = sha256(DebugApp.id + dm.from_id).digest()[:16]
+    new_dm = DebugMessage(
+        DebugOp.RESPOND_PEER_LIST, int(time()), dm.nonce, Packager.node_id, json.dumps(info).encode()
+    )
+    Gossip.invoke('publish', topic_id, serialize_dm(new_dm))
+
+def handle_request_routes(dm: DebugMessage):
+    Gossip = Packager.apps.get(gossip_app_id, None)
+    if Gossip is None:
+        return
+    info = {
+        'node_id': Packager.node_id.hex(),
+        'routes': {
+            str(addr): pid.hex()
+            for addr, pid in Packager.routes.items()
+        },
+    }
+    topic_id = sha256(DebugApp.id + dm.from_id).digest()[:16]
+    new_dm = DebugMessage(
+        DebugOp.RESPOND_ROUTES, int(time()), dm.nonce, Packager.node_id, json.dumps(info).encode()
+    )
+    Gossip.invoke('publish', topic_id, serialize_dm(new_dm))
+
+def handle_request_next_hop(dm: DebugMessage):
+    Gossip = Packager.apps.get(gossip_app_id, None)
+    if Gossip is None:
+        return
+    metric, tree_state, addr = unpack('!BB16s', dm.data)
+    next_hop = Packager.next_hop(Address(tree_state, addr), metric)
+    info = {
+        'next_hop': (next_hop[0].id.hex(), str(next_hop[1]))
+            if next_hop is not None else None,
+    }
+    topic_id = sha256(DebugApp.id + dm.from_id).digest()[:16]
+    Gossip.invoke('publish', topic_id, serialize_dm(DebugMessage(
+        DebugOp.RESPOND_NEXT_HOP, int(time()), dm.nonce, Packager.node_id,
+        json.dumps(info).encode()
+    )))
+
+def handle_require(dm: DebugMessage):
+    if not debug_auth_check(dm.data):
+        print('DebugApp: REQUIRE_* received with invalid auth data; ignoring')
+        return
+    Gossip = Packager.apps.get(gossip_app_id, None)
+    if Gossip is None:
+        return
+    topic_id = sha256(DebugApp.id + dm.from_id).digest()[:16]
+    if dm.op == DebugOp.REQUIRE_RESET:
+        print('DebugApp: REQUIRE_RESET received; scheduling reset')
+        Packager.queue_event(Event(
+            time_ms() + 200,
+            b'reset',
+            reset
+        ))
+        Gossip.invoke('publish', topic_id, serialize_dm(DebugMessage(
+            DebugOp.OK, int(time()), dm.nonce, Packager.node_id,
+            json.dumps({'op': 'REQUIRE_RESET'}).encode()
+        )))
+    elif dm.op == DebugOp.REQUIRE_REFLECT:
+        print('DebugApp: REQUIRE_REFLECT received')
+        op = dm.data[0]
+        Gossip.invoke('publish', topic_id, serialize_dm(DebugMessage(
+            op, int(time()), dm.nonce, Packager.node_id, dm.data[1:]
+        )))
+    else:
+        print('DebugApp: REQUIRE_* received with unknown op; ignoring')
+
+def handle_response(dm: DebugMessage):
+    if len(dm.data):
+        try:
+            info = json.loads(dm.data.decode())
+        except:
+            info = {'error': 'Invalid JSON received', 'data': dm.data}
+    else:
+        info = {}
+    result = {
+        'op': _inverse_op.get(dm.op, 'UNKNOWN'),
+        'from_id': dm.from_id.hex(),
+    }
+    result.update(info)
+    DebugApp.invoke('output', result)
+    seen_results.append(result)
+
+def request_debug_info(op: int, peer_id: bytes, data: bytes = b''):
+    Gossip = Packager.apps.get(gossip_app_id, None)
+    if Gossip is None:
+        return
+    peer_id = peer_id if type(peer_id) is bytes else bytes.fromhex(peer_id)
+    topic_id = sha256(DebugApp.id + peer_id).digest()[:16]
+    nonce = randint(0, 2**16 - 1)
+    dm = DebugMessage(op, int(time()), nonce, Packager.node_id, data)
+    Gossip.invoke('publish', topic_id, serialize_dm(dm))
+
+def require_action(op: int, peer_id: bytes, data: bytes):
+    Gossip = Packager.apps.get(gossip_app_id, None)
+    if Gossip is None:
+        return
+    peer_id = peer_id if type(peer_id) is bytes else bytes.fromhex(peer_id)
+    topic_id = sha256(DebugApp.id + peer_id).digest()[:16]
+    nonce = randint(0, 2**16 - 1)
+    dm = DebugMessage(op, int(time()), nonce, Packager.node_id, data)
+    Gossip.invoke('publish', topic_id, serialize_dm(dm))
+
+def start_debug_app():
+    Gossip = Packager.apps.get(gossip_app_id, None)
+    if Gossip is not None:
+        topic_id = sha256(DebugApp.id + Packager.node_id).digest()[:16]
+        Gossip.invoke('subscribe', topic_id, DebugApp.id)
+
+def stop_debug_app():
+    Gossip = Packager.apps.get(gossip_app_id, None)
+    if Gossip is not None:
+        topic_id = sha256(DebugApp.id + Packager.node_id).digest()[:16]
+        Gossip.invoke('unsubscribe', topic_id, DebugApp.id)
+
+DebugApp = Application(
+    name='DebugApp',
+    description='Debug App',
+    version=0,
+    receive_func=receive_debug,
+    callbacks={
+        'handle_request_node_info': lambda _, dm: handle_request_node_info(dm),
+        'handle_request_peer_list': lambda _, dm: handle_request_peer_list(dm),
+        'handle_request_routes': lambda _, dm: handle_request_routes(dm),
+        'handle_request_next_hop': lambda _, dm: handle_request_next_hop(dm),
+        'handle_response': lambda _, dm: handle_response(dm),
+        'handle_require': lambda _, dm: handle_require(dm),
+        'request': lambda _, op, peer_id, *args: request_debug_info(op, peer_id, *args),
+        'require': lambda _, op, peer_id, data: require_action(op, peer_id, data),
+        'deserialize': lambda _, blob: deserialize_dm(blob),
+        'serialize': lambda _, dm: serialize_dm(dm),
+        'start': lambda _: start_debug_app(),
+        'stop': lambda _: stop_debug_app(),
+        'get_seen': lambda _: seen_results,
+        'auth_check': lambda _, data: debug_auth_check(data),
+    }
+)
+
+Packager.add_application(DebugApp)
+# save_imports
+import network
+import espnow
 
 
 _config = {}
@@ -3217,9 +3632,12 @@ def config_espnwintrfc(intrfc: Interface, data: dict):
         _config[k] = v
 
 def recv_espnwintrfc(intrfc: Interface) -> bytes|None:
-    res = e.recv(0)
-    if res and res[0]:
-        return Datagram(res[1], intrfc.id, res[0])
+    try:
+        res = e.recv(0)
+        if res and len(res) == 2 and res[0] and res[1]:
+            return Datagram(res[1], intrfc.id, res[0])
+    except:
+        return None
 
 def send_espnwintrfc(datagram: Datagram):
     if datagram.addr not in [p[0] for p in e.get_peers()]:
@@ -3242,4 +3660,132 @@ ESPNowInterface = Interface(
 )
 
 Packager.add_interface(ESPNowInterface)
+"""Copyright (c) 2025 Jonathan Voss (k98kurz)
+
+Permission to use, copy, modify, and/or distribute this software
+for any purpose with or without fee is hereby granted, provided
+that the above copyleft notice and this permission notice appear in
+all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL
+WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE
+AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR
+CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS
+OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT,
+NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+"""
+
+try:
+    from asyncio import sleep_ms
+except ImportError:
+    # platform differences with CPython; enable testing
+    from asyncio import sleep
+    sleep_ms = lambda ms: sleep(ms / 1000)
+
+from collections import deque
+import sys
+import select
+
+
+line_buffer = deque([], 10)
+
+async def ainput(prompt="", timeout=False):
+    """An asynchronous line input function for MicroPython that detects arrow key sequences."""
+    sys.stdout.write(prompt)
+    flush = getattr(sys.stdout, 'flush', lambda: None)
+    flush()
+    line = ""
+    while True:
+        # Poll sys.stdin to see if there's any data available.
+        r, _, _ = select.select([sys.stdin], [], [], 0)
+        if r:
+            char = sys.stdin.read(1)
+
+            # Detect beginning of an escape sequence.
+            if char == "\x1b":
+                # Give a tiny window for the next bytes (usually 2) to arrive.
+                r2, _, _ = select.select([sys.stdin], [], [], 0.01)
+                if r2:
+                    # Read the next two characters.
+                    seq = sys.stdin.read(2)
+                    if len(seq) == 2 and seq[0] == "[" and seq[1] in "ABCD":
+                        # Arrow key: (ESC + '[' + [A, B, C, or D])
+                        if seq[1] == "A":
+                            # up
+                            if len(line_buffer):
+                                # clear the line
+                                oldl = line
+                                oldll = len(line)
+                                line = line_buffer.pop()
+                                line_buffer.appendleft(line)
+                                if oldl == line:
+                                    sys.stdout.write("\r" + prompt + " " * oldll)
+                                else:
+                                    sys.stdout.write("\r" + prompt + line)
+                                    sys.stdout.write(" " * (oldll - len(line)))
+                                # move cursor to the end of the line
+                                sys.stdout.write("\r" + prompt + line)
+                                flush()
+                        elif seq[1] == "B":
+                            # down
+                            if len(line_buffer):
+                                # clear the line
+                                oldl = line
+                                oldll = len(line)
+                                line = line_buffer.popleft()
+                                line_buffer.append(line)
+                                sys.stdout.write("\r" + prompt + line)
+                                sys.stdout.write(" " * (oldll - len(line)))
+                                if oldl == line:
+                                    sys.stdout.write("\r" + prompt + " " * oldll)
+                                else:
+                                    sys.stdout.write("\r" + prompt + line)
+                                    sys.stdout.write(" " * (oldll - len(line)))
+                                # move cursor to the end of the line
+                                sys.stdout.write("\r" + prompt + line)
+                                flush()
+                        elif seq[1] == "C":
+                            # right; ignore
+                            ...
+                        elif seq[1] == "D":
+                            # left; ignore
+                            ...
+                        continue
+                    else:
+                        # Not an arrow key; treat the escape and sequence as normal text.
+                        line += char + seq
+                        sys.stdout.write(char + seq)
+                        flush()
+                        continue
+                else:
+                    # No additional characters found; treat the ESC as a normal character.
+                    line += char
+                    sys.stdout.write(char)
+                    flush()
+                    continue
+
+            if char in ("\r", "\n"):
+                sys.stdout.write("\n")
+                flush()
+                if len(line) and line not in line_buffer:
+                    line_buffer.append(line)
+                return line
+            elif char in ("\x08", "\x7f"):
+                if line:
+                    line = line[:-1]
+                    # Erase the last character visually.
+                    sys.stdout.write("\b \b")
+                    flush()
+            else:
+                line += char
+                sys.stdout.write(char)
+                flush()
+        # Yield control so other asyncio tasks can run.
+        await sleep_ms(10)
+
+        # If the timeout flag is set, return None.
+        if timeout:
+            return None
 
