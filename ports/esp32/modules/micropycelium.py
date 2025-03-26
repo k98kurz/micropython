@@ -49,6 +49,8 @@ MODEM_INTERSECT_RTX_TIMES = micropython.const(
     int((MODEM_SLEEP_MS+MODEM_WAKE_MS)/MODEM_INTERSECT_INTERVAL) + 1
 )
 SEQ_SYNC_DELAY_MS = micropython.const(10_000)
+SEND_RETRY_DELAY_MS = micropython.const(2_000)
+SEND_RETRY_COUNT = micropython.const(3)
 dTree = micropython.const(0)
 dCPL = micropython.const(1)
 
@@ -488,7 +490,7 @@ def get_schema(id: int) -> Schema:
             Field('body', 0, bytes, 203),
         ])
     if id == 11:
-        # ESP-NOW; one-hop routable; 216 max Package size.
+        # ESP-NOW; one-hop relayable; 216 max Package size.
         return Schema(0, 11, [
             Field('packet_id', 1, int, 0),
             Field('tree_state', 1, int, 0),
@@ -497,7 +499,7 @@ def get_schema(id: int) -> Schema:
             Field('body', 0, bytes, 216),
         ])
     if id == 12:
-        # ESP-NOW; one-hop routable; 256 max sequence size; 53.5 KiB max Package size.
+        # ESP-NOW; one-hop relayable; 256 max sequence size; 53.5 KiB max Package size.
         return Schema(0, 12, [
             Field('packet_id', 1, int, 0),
             Field('seq_id', 1, int, 0),
@@ -508,7 +510,7 @@ def get_schema(id: int) -> Schema:
             Field('body', 0, bytes, 214),
         ])
     if id == 13:
-        # ESP-NOW; one-hop routable; 65536 max sequence size; 13.25 MiB max Package size.
+        # ESP-NOW; one-hop relayable; 65536 max sequence size; 13.25 MiB max Package size.
         return Schema(0, 13, [
             Field('packet_id', 2, int, 0),
             Field('seq_id', 1, int, 0),
@@ -629,7 +631,7 @@ def get_schema(id: int) -> Schema:
             Field('body', 0, bytes, 193),
         ])
     if id == 31:
-        # LYLR-998; one-hop routable; 206 max Package size.
+        # LYLR-998; one-hop relayable; 206 max Package size.
         return Schema(0, 31, [
             Field('packet_id', 1, int, 0),
             Field('tree_state', 1, int, 0),
@@ -638,7 +640,7 @@ def get_schema(id: int) -> Schema:
             Field('body', 0, bytes, 206),
         ])
     if id == 32:
-        # LYLR-998; one-hop routable; 256 max sequence size; 51 KiB max Package size.
+        # LYLR-998; one-hop relayable; 256 max sequence size; 51 KiB max Package size.
         return Schema(0, 32, [
             Field('packet_id', 1, int, 0),
             Field('seq_id', 1, int, 0),
@@ -649,7 +651,7 @@ def get_schema(id: int) -> Schema:
             Field('body', 0, bytes, 204),
         ])
     if id == 33:
-        # LYLR-998; one-hop routable; 65536 max sequence size; 12.625 MiB max Package size.
+        # LYLR-998; one-hop relayable; 65536 max sequence size; 12.625 MiB max Package size.
         return Schema(0, 33, [
             Field('packet_id', 2, int, 0),
             Field('seq_id', 1, int, 0),
@@ -1081,6 +1083,8 @@ class Address:
             self, tree_state: int, address: bytes|bytearray|None = None,
             coords: list[int]|None = None
         ) -> None:
+        if type(tree_state) is not int:
+            raise TypeError("tree_state must be an int")
         if address is coords is None:
             raise ValueError("must provide at least one of address or coords")
         if address is not None and type(address) not in (bytes, bytearray):
@@ -1139,7 +1143,6 @@ class Address:
             prefix, postfix = parts
             addr = prefix + '0' * (32 - len(prefix) - len(postfix)) + postfix
         return cls(int(tree_state), address=bytes.fromhex(addr))
-
 
     @staticmethod
     def decode(address: bytes|bytearray) -> list[int,]:
@@ -1366,7 +1369,7 @@ class InSequence:
         self.seq = seq
         self.src = src
         self.intrfc = intrfc
-        self.retry = 2
+        self.retry = 3
 
 
 # @micropython.native
@@ -1380,7 +1383,7 @@ class Cache:
         self.items = {}
         self.lowest_expiry = -1
 
-    def add(self, key: bytes, value: object, ttl: int = 60):
+    def add(self, key: bytes|str|int, value: object, ttl: int = 60):
         self.items.pop(key, None)
         # if we hit the limit, remove the item that has the lowest expiry
         if len(self.items) >= self.limit:
@@ -1426,7 +1429,8 @@ class Packager:
     interfaces: list[Interface] = []
     seq_id: int = 0
     packet_id: int = 0
-    seq_cache: dict[int, Sequence] = {} # to-do
+    seq_cache: Cache = Cache(10)
+    packet_cache: Cache = Cache(10)
     in_seqs: dict[int, InSequence] = {}
     peers: dict[bytes, Peer] = {}
     inverse_peers: dict[tuple[bytes, bytes], bytes] = {} # map (mac, intrfc.id): peer_id
@@ -1449,11 +1453,13 @@ class Packager:
         cls.seq_id = 0
         cls.packet_id = 0
         cls.seq_cache.clear()
+        cls.packet_cache.clear()
         cls.in_seqs.clear()
         cls.peers.clear()
         cls.inverse_peers.clear()
         cls.routes.clear()
         cls.inverse_routes.clear()
+        cls.banned.clear()
         clear(cls.node_addrs)
         cls.apps.clear()
         cls.schedule.clear()
@@ -1587,7 +1593,8 @@ class Packager:
     def unban(cls, node_id: bytes):
         """Unbans a node from being a peer or known route."""
         cls.call_hook('unban', node_id)
-        cls.banned.remove(node_id)
+        if node_id in cls.banned:
+            cls.banned.remove(node_id)
 
     @classmethod
     def set_addr(cls, addr: Address):
@@ -1615,9 +1622,12 @@ class Packager:
         cls.sleepskip.append(True)
         # cls.sleepskip.extend([True for _ in range(MODEM_INTERSECT_RTX_TIMES)])
         cls.call_hook('broadcast', app_id, blob, interface)
+        sids: set[int] = set()
+        schemas: list[Schema] = []
         schema: Schema
         chosen_intrfcs: list[Interface]
         if interface:
+            sids = set(interface.supported_schemas)
             schemas = [
                 s for s in get_schemas(interface.supported_schemas)
                 if s.max_blob >= len(blob) + 32
@@ -1626,10 +1636,10 @@ class Packager:
             chosen_intrfcs = [interface]
         else:
             # use only a schema supported by all interfaces
-            schemas = set(cls.interfaces[0].supported_schemas)
+            sids = set(cls.interfaces[0].supported_schemas)
             for interface in cls.interfaces:
-                schemas.intersection_update(set(interface.supported_schemas))
-            schemas = [s for s in get_schemas(list(schemas)) if s.max_blob >= len(blob) + 32]
+                sids.intersection_update(set(interface.supported_schemas))
+            schemas = [s for s in get_schemas(list(sids)) if s.max_blob >= len(blob) + 32]
             if len(schemas) == 0:
                 return False
             # choose the schema with the largest body size
@@ -1642,16 +1652,21 @@ class Packager:
         fields = {'body':p, 'packet_id': cls.packet_id, 'seq_id': cls.seq_id, 'seq_size': 1}
         p1 = Packet(schema, fl, fields)
         # try to send as a single packet if possible
-        try:
-            if len(p) <= schema.max_body:
-                packets = [p1]
-            else:
-                raise ValueError()
-        except:
+        if len(p) <= schema.max_body:
+            packets = [p1]
+        else:
+            sids.intersection_update(SCHEMA_IDS_SUPPORT_SEQUENCE)
+            if len(sids) == 0:
+                return False
+            schemas = [s for s in get_schemas(list(sids)) if s.max_blob >= len(p)]
+            if len(schemas) == 0:
+                return False
+            schemas.sort(key=lambda s: s.max_body, reverse=True)
+            schema = schemas[0]
             s = Sequence(schema, cls.seq_id, len(p))
             s.set_data(p)
             packets = [s.get_packet(i, fl, fields) for i in range(s.seq_size)]
-            cls.seq_cache[cls.seq_id] = s
+            cls.seq_cache.add(cls.seq_id, s)
             cls.seq_id = (cls.seq_id + 1) % 256
 
         for intrfc in chosen_intrfcs:
@@ -1695,7 +1710,8 @@ class Packager:
     @classmethod
     def send(
         cls, app_id: bytes, blob: bytes, node_id: bytes|None = None,
-        to_addr: Address|None = None, schema: int = None, metric: int = dTree
+        to_addr: Address|None = None, schema: int = None, metric: int = dTree,
+        retry_count: int = SEND_RETRY_COUNT
     ) -> bool:
         """Attempts to send a Package containing the app_id and blob to
             the specified node. Returns True if it can be sent and False
@@ -1734,6 +1750,8 @@ class Packager:
         sids = set(intrfcs[0][1].supported_schemas)
         for _, ntrfc in intrfcs:
             sids.intersection_update(set(ntrfc.supported_schemas))
+        if not islocal:
+            sids.intersection_update(set(SCHEMA_IDS_SUPPORT_ROUTING))
         sids = get_schemas(list(sids))
         sids = [s for s in sids if s.max_blob >= len(p)]
         sids.sort(key=lambda s: s.max_body, reverse=True)
@@ -1748,6 +1766,7 @@ class Packager:
             fields['to_addr'] = to_addr.address
             fields['from_addr'] = cls.node_addrs[-1].address
             fields['tree_state'] = to_addr.tree_state
+            fields['ttl'] = 255
         if schema.max_blob > schema.max_body:
             seq = Sequence(schema, cls.seq_id, len(p))
             seq.set_data(p)
@@ -1759,14 +1778,40 @@ class Packager:
                 ), peer)
         else:
             fields['body'] = p
-            cls._send_datagram(Datagram(
-                Packet(schema, Flags(0), fields).pack(),
-                intrfc[1].id,
-                intrfc[0]
-            ), peer)
+            flags = Flags(0)
+            flags.ask = True
+            p = Packet(schema, flags, fields)
+            cls._send_datagram(Datagram(p.pack(), intrfc[1].id, intrfc[0]), peer)
+            cls.packet_cache.add(cls.packet_id, p)
             cls.packet_id = (cls.packet_id + 1) % 256
+            eid = b'RP' + p.id.to_bytes(1, 'big')
+            cls.new_events.append(Event(
+                time_ms() + SEND_RETRY_DELAY_MS,
+                eid,
+                cls.retry_send,
+                p.fields['packet_id'],
+                retry_count,
+                to_addr,
+                node_id,
+                metric,
+            ))
 
         return True
+
+    @classmethod
+    def retry_send(
+        cls, pid: int, count: int, to_addr: Address|None = None,
+        node_id: bytes|None = None, metric: int = dTree
+    ):
+        p: Packet|None = cls.packet_cache.get(pid)
+
+        if count <= 0 or p is None:
+            return
+
+        if to_addr is None and node_id is None:
+            return
+        p2 = Package.unpack(p.body)
+        cls.send(p2.app_id, p2.blob, node_id, to_addr, p.schema, metric, count-1)
 
     @classmethod
     def get_interface(
@@ -1922,12 +1967,12 @@ class Packager:
                 )
 
             if 'ttl' in packet.fields:
-                packet.fields['ttl'] += -1 if packet.flags.error else 1
+                packet.fields['ttl'] += 1 if packet.flags.error else -1
 
             if packet.fields.get('ttl', 1) <= 0 and not packet.flags.error:
                 # drop the packet
                 return False
-            if packet.fields.get('ttl', 1) > 255 and packet.flags.error:
+            if packet.fields.get('ttl', 1) >= 255 and packet.flags.error:
                 # drop the packet
                 return False
         else:
@@ -1990,6 +2035,30 @@ class Packager:
         ))
 
     @classmethod
+    def _send_ack(cls, p: Packet, src: bytes|None = None):
+        flags = Flags(p.flags.state)
+        flags.ask = False
+        flags.ack = True
+        fields = {
+            'packet_id': p.id,
+            'body': b'',
+        }
+        if 'to_addr' in p.fields:
+            fields['to_addr'] = p.fields['from_addr']
+            fields['from_addr'] = p.fields['to_addr']
+            fields['tree_state'] = p.fields['tree_state']
+        if 'ttl' in p.fields:
+            fields['ttl'] = 255
+        if 'seq_id' in p.fields:
+            fields['seq_size'] = p.fields['seq_size']
+            fields['seq_id'] = p.fields['seq_id']
+        cls.send_packet(Packet(
+            p.schema,
+            flags,
+            fields
+        ), src)
+
+    @classmethod
     def receive(cls, p: Packet, intrfc: Interface, mac: bytes) -> None:
         """Receives a Packet and determines what to do with it. If it is
             a routable packet, forward to the next hop using send_packet;
@@ -2009,34 +2078,12 @@ class Packager:
                 # forward
                 cls.send_packet(p)
                 return
-            else:
-                # this is the intended delivery point
-                if p.flags.ask:
-                    # send ack
-                    flags = Flags(p.flags.state)
-                    flags.ask = False
-                    flags.ack = True
-                    fields = {
-                        'packet_id': p.id,
-                        'to_addr': p.fields['from_addr'],
-                        'from_addr': p.fields['to_addr'],
-                        'tree_state': p.fields['tree_state'],
-                        'body': b'',
-                    }
-                    if 'seq_id' in p.fields:
-                        fields['seq_size'] = p.fields['seq_size']
-                        fields['seq_id'] = p.fields['seq_id']
-                    cls.send_packet(Packet(
-                        p.schema,
-                        flags,
-                        fields
-                    ))
         for nid, peer in cls.peers.items():
             if mac in (i[0] for i in peer.interfaces if i[1] is intrfc):
                 src = nid
                 break
 
-        if 'seq_id' in p.fields:
+        if 'seq_id' in p.fields and not p.flags.rtx:
             # try to reconstitute the sequence
             # first cancel pending sequence synchronization event
             seq_id = p.fields['seq_id']
@@ -2063,6 +2110,29 @@ class Packager:
                     cls.sync_sequence,
                     seq_id
                 ))
+            if p.flags.ask:
+                # send ack
+                cls._send_ack(p, src)
+            return
+        elif 'seq_id' in p.fields and p.flags.rtx:
+            # request for retransmission: send packet if the sequence is still in the cache
+            seq_id = p.fields['seq_id']
+            seq: Sequence|None = cls.seq_cache.get(seq_id)
+            if seq is None:
+                return
+            p = seq.get_packet(p.id, Flags(0))
+            if p is None:
+                return
+            cls.send_packet(p)
+            return
+        elif p.flags.rtx:
+            # request retransmission of a non-sequence packet
+            pid = p.fields['packet_id']
+            packet = cls.packet_cache.get(pid)
+            if packet is None:
+                return
+            cls.send_packet(packet)
+            return
         elif p.flags.nia and len(src):
             # peer responded to RNS: cancel event, update peer.last_rx
             cls.call_hook('receive:nia', p, intrfc, mac)
@@ -2087,27 +2157,16 @@ class Packager:
             ))
             cls.packet_id = (cls.packet_id + 1) % 256
             return
-        else:
-            # parse and deliver the Package
-            cls.deliver(Package.unpack(p.body), intrfc, mac)
+        elif p.flags.ack:
+            cls.cancel_events.append(b'RP' + p.id.to_bytes(1, 'big'))
+            return
 
         if p.flags.ask:
             # send ack
-            flags = Flags(p.flags.state)
-            flags.ask = False
-            flags.ack = True
-            fields = {
-                'packet_id': p.id,
-                'body': b'',
-            }
-            if 'seq_id' in p.fields:
-                fields['seq_size'] = p.fields['seq_size']
-                fields['seq_id'] = p.fields['seq_id']
-            cls.send_packet(Packet(
-                p.schema,
-                flags,
-                fields
-            ), src)
+            cls._send_ack(p, src)
+
+        # parse and deliver the Package
+        cls.deliver(Package.unpack(p.body), intrfc, mac)
 
     @classmethod
     def deliver(cls, p: Package, i: Interface, mac: bytes) -> bool:
@@ -2380,6 +2439,10 @@ def schedule_beacon():
         Beacon.params['beacon_count']
     ))
 
+def stop_beacon():
+    Packager.cancel_events.append(beacon_app_id)
+    Packager.cancel_events.append(beacon_app_id+b's')
+
 Beacon = Application(
     name='Beacon',
     description='Dev Beacon App',
@@ -2394,6 +2457,7 @@ Beacon = Application(
         'deserialize': lambda _, blob: deserialize_bm(blob),
         # 'start': lambda _: periodic_beacon(MODEM_INTERSECT_RTX_TIMES),
         'start': lambda _: periodic_beacon(2),
+        'stop': lambda _: stop_beacon(),
         'get_seen': lambda _: seen_bm,
         'get_sent': lambda _: sent_bm,
     },
@@ -2592,7 +2656,7 @@ def sync_all_peers():
         sync_all_peers,
     ))
 
-def start():
+def start_gossip_app():
     Packager.add_hook('add_peer', add_peer_callback)
     if Gossip.id in Packager.schedule:
         return
@@ -2602,8 +2666,9 @@ def start():
         sync_all_peers,
     ))
 
-def stop():
+def stop_gossip_app():
     Packager.remove_hook('add_peer', add_peer_callback)
+    Packager.cancel_events.append(Gossip.id)
 
 def get_messages(topic_id: bytes):
     res = []
@@ -2629,14 +2694,14 @@ Gossip = Application(
         'unsubscribe': lambda _, topic_id, app_id: unsubscribe_gossip(topic_id, app_id),
         'deliver_gossip': lambda _, gm: deliver_gossip(gm),
         'sync': lambda _: sync_all_peers(),
-        'start': lambda _: start(),
-        'stop': lambda _: stop(),
+        'start': lambda _: start_gossip_app(),
+        'stop': lambda _: stop_gossip_app(),
         'get_seen': lambda _: seen_gm,
         'get_subscriptions': lambda _: subscriptions,
         'get_cache': lambda _: message_cache,
         'get_messages': lambda _, topic_id: get_messages(topic_id),
-        'serialize_gm': lambda _, gm: serialize_gm(gm),
-        'deserialize_gm': lambda _, blob: deserialize_gm(blob),
+        'serialize': lambda _, gm: serialize_gm(gm),
+        'deserialize': lambda _, blob: deserialize_gm(blob),
     },
     params={
         'start_delay': 10,
@@ -2676,7 +2741,7 @@ current_children: dict[bytes, int] = {} # map of child peer ids to coordinates
 current_parent: bytes = b''
 tree_last_ts = int(time())
 # tuple of (claim, dTree from root, peer_id)
-known_claims: deque[tuple[bytes, int, bytes]] = deque([], 10)
+known_claims: deque[tuple[bytes, int, int, bytes]] = deque([], 10)
 
 # elect self as initial root
 current_best_root_id = Packager.node_id
@@ -2755,6 +2820,12 @@ def receive_tm(app: Application, blob: bytes, intrfc: Interface, mac: bytes):
     elif tmsg.op == TreeOp.REQUEST_ADDRESS_ASSIGNMENT:
         # received an address assignment request
         if tree_state(tmsg.claim) == Packager.node_addrs[-1].tree_state:
+            # only respond if the request is for the current tree_state
+            if peer_id in current_children:
+                # if the node is already child, send its existing address
+                coords = list(Packager.node_addrs[-1].coords) + [current_children[peer_id]]
+                SpanningTree.invoke('assign_address', peer_id, coords)
+                return
             # respond with the address assignment
             coords = list(Packager.node_addrs[-1].coords)
             coord = lwst_avlbl_coord()
@@ -2885,24 +2956,27 @@ def maintain_tree():
         if int(time()) - ts < SpanningTree.params['max_tree_age']:
             known_claims.append((claim, ts, dTree, peer_id))
 
-    # check if there is no parent and there are known claims
-    if current_parent == b'' and len(known_claims) > 0:
+    # evaluate known claims
+    if len(known_claims) > 0:
+        current_dTree = Address.dTree(
+            Packager.node_addrs[-1],
+            Address(tree_state(current_best_root_id), coords=[])
+        )
         # get the best known claim (and shortest distance from root)
         claims = list(known_claims)
         claims.sort(key=lambda t: claim_score(t[0]) + t[1])
-        best_claim, ts, _, peer_id = claims[0]
-        if claim_score(best_claim) < claim_score(current_best_root_id):
-            # request an address assignment from the best claim
+        best_claim, _, dTree, peer_id = claims[0]
+        if claim_score(best_claim) < claim_score(current_best_root_id) or (
+            claim_score(best_claim) == claim_score(current_best_root_id) and
+            dTree < current_dTree - 1
+        ):
+            # request an address assignment from the best claim with shortest distance from root
             SpanningTree.invoke('request_address_assignment', peer_id, best_claim)
-        else:
-            # we have the best claim, so begin broadcasting it
-            tree_last_ts = int(time())
-            periodic_tree_message(SpanningTree.params['broadcast_count'])
-    else:
-        # begin broadcasting
-        if current_best_root_id == Packager.node_id:
-            tree_last_ts = int(time())
-        periodic_tree_message(SpanningTree.params['broadcast_count'])
+
+    # begin broadcasting
+    if current_best_root_id == Packager.node_id:
+        tree_last_ts = int(time())
+    periodic_tree_message(SpanningTree.params['broadcast_count'])
 
     # tree_maintenance_rounds += 1
     # if tree_maintenance_rounds >= 5:
@@ -2947,7 +3021,7 @@ def schedule_start(pub = None, sub = None):
         if SpanningTree.params.get('sub'):
             Gossip.invoke('subscribe', tree_app_id, tree_app_id)
 
-def stop():
+def stop_tree_app():
     """Cancels all events and removes all hooks."""
     Packager.remove_hook('remove_peer', remove_peer)
     Packager.remove_hook('set_addr', set_addr_gossip_callback)
@@ -2974,7 +3048,7 @@ SpanningTree = Application(
         'serialize': lambda _, tm: serialize_tm(tm),
         'deserialize': lambda _, blob: deserialize_tm(blob),
         'start': lambda _, **kwargs: schedule_start(**kwargs),
-        'stop': lambda _: stop(),
+        'stop': lambda _: stop_tree_app(),
         'claim_score': lambda _, claim: claim_score(claim),
         'get_known_claims': lambda _: known_claims,
         'get_current_children': lambda _: current_children,
@@ -3058,7 +3132,8 @@ def ping_request(
         node_id = None
     else:
         addr = None
-        node_id = nid_or_addr
+        node_id = nid_or_addr if type(nid_or_addr) is bytes else bytes.fromhex(nid_or_addr)
+        nid_or_addr = node_id.hex()
     pm = PingMessage(
         PingOp.REQUEST,
         nonce if nonce is not None else randint(0, 255),
@@ -3272,15 +3347,15 @@ def run_ping_test(
     """
     if callback is not None:
         callback('ping test started')
-    topic_id = sha256(Ping.id + (node_id or addr.address)).digest()[:16]
-    topic_id += PingOp.REQUEST.to_bytes(1, 'big')
+    eid = sha256(Ping.id + (node_id or addr.address)).digest()[:16]
+    eid += PingOp.REQUEST.to_bytes(1, 'big')
     nonce = randint(0, 255)
     now = time_ms()
     addr = addr if addr is not None else Packager.inverse_routes.get(node_id, [None])[-1]
     for i in range(count):
         Packager.new_events.append(Event(
             now + i * 1000,
-            topic_id + i.to_bytes(1, 'big'),
+            eid + i.to_bytes(1, 'big'),
             ping_request,
             node_id or addr,
             metric,
@@ -3289,7 +3364,7 @@ def run_ping_test(
         ))
     Packager.new_events.append(Event(
         now + (timeout + count) * 1000,
-        topic_id + count.to_bytes(1, 'big'),
+        eid + count.to_bytes(1, 'big'),
         report_ping_test,
         nonce,
         'routed dTree' if metric == dTree else 'routed dCPL' if metric == dCPL else 'unknown metric',
@@ -3334,7 +3409,7 @@ def run_gossip_ping_test(
         callback,
     ))
 
-def start():
+def start_ping_app():
     """Subscribe to the gossip topic."""
     Gossip = Packager.apps.get(gossip_app_id, None)
     if Gossip is None:
@@ -3342,13 +3417,103 @@ def start():
     topic_id = sha256(Ping.id + Packager.node_id).digest()[:16]
     Gossip.invoke('subscribe', topic_id, Ping.id)
 
-def stop():
+def stop_ping_app():
     """Unsubscribe from the gossip topic."""
     Gossip = Packager.apps.get(gossip_app_id, None)
     if Gossip is None:
         return False
     topic_id = sha256(Ping.id + Packager.node_id).digest()[:16]
     Gossip.invoke('unsubscribe', topic_id, Ping.id)
+
+def hexify(thing):
+    if type(thing) is list:
+        return [hexify(i) for i in thing]
+    elif type(thing) is tuple:
+        return tuple(hexify(i) for i in thing)
+    elif type(thing) is bytes:
+        return thing.hex()
+    elif type(thing) is dict:
+        return {hexify(k): hexify(v) for k, v in thing.items()}
+    elif type(thing) in (int, float):
+        return thing
+    else:
+        return thing if type(thing) is str else repr(thing)
+
+def ping_cb(report):
+    if type(report) is str:
+        Ping.params['console_output'](report)
+        return
+    report = hexify(report)
+    r = 'Ping report:\n'
+    for k, v in report.items():
+        r += f'  {k}: {v}\n'
+    Ping.params['console_output'](r)
+
+async def _ping_command(cmd: list[str]):
+    """Ping a node."""
+    if len(cmd) < 1:
+        print('ping - missing required node_id|addr')
+        return
+    try:
+        nid = bytes.fromhex(cmd[0])
+        addr = None
+    except:
+        nid = None
+        addr = Address.from_str(cmd[0])
+    kwargs = {
+        'node_id': nid,
+        'addr': addr,
+        'callback': ping_cb,
+        'timeout': 2,
+    }
+    if len(cmd) > 1:
+        kwargs['count'] = int(cmd[1])
+    if len(cmd) > 2:
+        kwargs['timeout'] = int(cmd[2])
+    Ping.invoke('ping', **kwargs)
+    await Ping.params['console_wait'](kwargs.get('count', 4) + 2)
+
+async def _gossip_ping_command(cmd: list[str]):
+    """Ping a node via gossip."""
+    if len(cmd) < 1:
+        print('gossip_ping - missing required subcommand')
+        return
+    nid = bytes.fromhex(cmd[0])
+    kwargs = {
+        'node_id': nid,
+        'callback': ping_cb,
+        'timeout': 2,
+    }
+    if len(cmd) > 1:
+        kwargs['count'] = int(cmd[1])
+    if len(cmd) > 2:
+        kwargs['timeout'] = int(cmd[2])
+    Ping.invoke('gossip_ping', **kwargs)
+    await Ping.params['console_wait'](kwargs.get('count', 4) + 2)
+
+def register_ping_cmds(
+        add_command: Callable, add_alias: Callable, wait: Callable,
+        output: Callable
+    ):
+    """Register console commands."""
+    Ping.params['console_wait'] = wait
+    Ping.params['console_output'] = output
+    add_command(
+        'ping',
+        _ping_command,
+        'ping [node_id|addr] [count] [timeout] - ping the node_id/address\n' +
+            '\tcount should be <60 (memory constraint); default value is 4\n' +
+            '\ttimeout default value is 2 (seconds)\n' +
+            '\tIf node_id is provided, it will attempt to find the address ' +
+            'from the known routes'
+    )
+    add_command(
+        'gossip_ping',
+        _gossip_ping_command,
+        'gossip_ping [node_id] [count] [timeout] - ping the node via gossip\n' +
+            '\tcount should be <60 (memory constraint); default value is 4\n' +
+            '\ttimeout default value is 2 (seconds)'
+    )
 
 Ping = Application(
     name='Ping',
@@ -3362,15 +3527,16 @@ Ping = Application(
         'gossip_request': lambda _, node_id: ping_gossip_request(node_id),
         'gossip_respond': lambda _, pm: ping_gossip_respond(pm),
         'gossip_response_received': lambda _, pm: ping_gossip_response_received(pm),
-        'serialize_pm': lambda _, pm: serialize_pm(pm),
-        'deserialize_pm': lambda _, blob: deserialize_pm(blob),
-        'start': lambda _: start(),
-        'stop': lambda _: stop(),
+        'serialize': lambda _, pm: serialize_pm(pm),
+        'deserialize': lambda _, blob: deserialize_pm(blob),
+        'start': lambda _: start_ping_app(),
+        'stop': lambda _: stop_ping_app(),
         'list_routes': lambda _: ping_list_routes(),
         'ping': lambda _, *args, **kwargs: run_ping_test(*args, **kwargs),
         'gossip_ping': lambda _, *args, **kwargs: run_gossip_ping_test(*args, **kwargs),
         'report_ping_test': lambda _, *args, **kwargs: report_ping_test(*args, **kwargs),
         'get_ping_responses': lambda _: ping_responses,
+        'register_commands': lambda _, *args, **kwargs: register_ping_cmds(*args, **kwargs),
     }
 )
 
@@ -3388,7 +3554,12 @@ DebugOp = enum(
     RESPOND_PEER_LIST = 101,
     RESPOND_ROUTES = 102,
     RESPOND_NEXT_HOP = 103,
+    # ERROR = 199,
     OK = 200,
+    AUTH_ERROR = 201,
+    REQUIRE_SET_PW = 251,
+    REQUIRE_BAN = 252,
+    REQUIRE_UNBAN = 253,
     REQUIRE_REFLECT = 254,
     REQUIRE_RESET = 255,
 )
@@ -3401,7 +3572,12 @@ _inverse_op = {
     DebugOp.RESPOND_PEER_LIST: 'RESPOND_PEER_LIST',
     DebugOp.RESPOND_ROUTES: 'RESPOND_ROUTES',
     DebugOp.RESPOND_NEXT_HOP: 'RESPOND_NEXT_HOP',
+    # DebugOp.ERROR: 'ERROR',
     DebugOp.OK: 'OK',
+    DebugOp.AUTH_ERROR: 'AUTH_ERROR',
+    DebugOp.REQUIRE_SET_PW: 'REQUIRE_SET_PW',
+    DebugOp.REQUIRE_BAN: 'REQUIRE_BAN',
+    DebugOp.REQUIRE_UNBAN: 'REQUIRE_UNBAN',
     DebugOp.REQUIRE_REFLECT: 'REQUIRE_REFLECT',
     DebugOp.REQUIRE_RESET: 'REQUIRE_RESET',
 }
@@ -3409,10 +3585,12 @@ DebugMessage = namedtuple('DebugMessage', ['op', 'ts', 'nonce', 'from_id', 'data
 
 gossip_app_id = bytes.fromhex('849969c1f22797d66f5a94db2afe634a')
 seen_results: deque[dict] = deque([], 10)
+
 def debug_auth_check(data: bytes):
     auth_hash1 = sha256(data).digest()[:16]
-    auth_hash2 = sha256(data[1:]).digest()[:16]
-    expected = bytes.fromhex('32549bff6d8404c4d121b589f4d24ac6')
+    l = data[0]
+    auth_hash2 = sha256(data[l+1:]).digest()[:16]
+    expected = DebugApp.params['admin_pass_hash']
     return auth_hash1 == expected or auth_hash2 == expected
 
 def serialize_dm(dm: DebugMessage):
@@ -3440,6 +3618,8 @@ def receive_debug(app: Application, blob: bytes, intrfc: Interface, mac: bytes):
     elif dm.op == DebugOp.RESPOND_NEXT_HOP:
         DebugApp.invoke('handle_response', dm)
     elif dm.op == DebugOp.OK:
+        DebugApp.invoke('handle_response', dm)
+    elif dm.op == DebugOp.AUTH_ERROR:
         DebugApp.invoke('handle_response', dm)
     else:
         DebugApp.invoke('handle_require', dm)
@@ -3510,15 +3690,19 @@ def handle_request_next_hop(dm: DebugMessage):
     )))
 
 def handle_require(dm: DebugMessage):
-    if not debug_auth_check(dm.data):
-        print('DebugApp: REQUIRE_* received with invalid auth data; ignoring')
-        return
     Gossip = Packager.apps.get(gossip_app_id, None)
     if Gossip is None:
         return
     topic_id = sha256(DebugApp.id + dm.from_id).digest()[:16]
+    if not debug_auth_check(dm.data):
+        DebugApp.invoke('output', 'DebugApp: REQUIRE_* received with invalid auth data; ignoring')
+        Gossip.invoke('publish', topic_id, serialize_dm(DebugMessage(
+            DebugOp.AUTH_ERROR, int(time()), dm.nonce, Packager.node_id,
+            json.dumps({'op': _inverse_op[dm.op], 'error': 'AUTH_ERROR'}).encode()
+        )))
+        return
     if dm.op == DebugOp.REQUIRE_RESET:
-        print('DebugApp: REQUIRE_RESET received; scheduling reset')
+        DebugApp.invoke('output', 'DebugApp: REQUIRE_RESET received; scheduling reset')
         Packager.queue_event(Event(
             time_ms() + 200,
             b'reset',
@@ -3529,13 +3713,38 @@ def handle_require(dm: DebugMessage):
             json.dumps({'op': 'REQUIRE_RESET'}).encode()
         )))
     elif dm.op == DebugOp.REQUIRE_REFLECT:
-        print('DebugApp: REQUIRE_REFLECT received')
-        op = dm.data[0]
+        DebugApp.invoke('output', 'DebugApp: REQUIRE_REFLECT received')
+        op = dm.data[1]
         Gossip.invoke('publish', topic_id, serialize_dm(DebugMessage(
-            op, int(time()), dm.nonce, Packager.node_id, dm.data[1:]
+            op, int(time()), dm.nonce, Packager.node_id, dm.data[2:]
+        )))
+    elif dm.op == DebugOp.REQUIRE_BAN:
+        DebugApp.invoke('output', 'DebugApp: REQUIRE_BAN received')
+        node_id = dm.data[1:33]
+        Packager.ban(node_id)
+        Gossip.invoke('publish', topic_id, serialize_dm(DebugMessage(
+            DebugOp.OK, int(time()), dm.nonce, Packager.node_id,
+            json.dumps({'op': 'REQUIRE_BAN', 'node_id': node_id.hex()}).encode()
+        )))
+    elif dm.op == DebugOp.REQUIRE_UNBAN:
+        DebugApp.invoke('output', 'DebugApp: REQUIRE_UNBAN received')
+        node_id = dm.data[1:33]
+        Packager.unban(node_id)
+        Gossip.invoke('publish', topic_id, serialize_dm(DebugMessage(
+            DebugOp.OK, int(time()), dm.nonce, Packager.node_id,
+            json.dumps({'op': 'REQUIRE_UNBAN', 'node_id': node_id.hex()}).encode()
+        )))
+    elif dm.op == DebugOp.REQUIRE_SET_PW:
+        DebugApp.invoke('output', 'DebugApp: REQUIRE_SET_PW received')
+        l = dm.data[0]
+        new_pasw = dm.data[1:1+l]
+        DebugApp.params['admin_pass_hash'] = sha256(new_pasw).digest()[:16]
+        Gossip.invoke('publish', topic_id, serialize_dm(DebugMessage(
+            DebugOp.OK, int(time()), dm.nonce, Packager.node_id,
+            json.dumps({'op': 'REQUIRE_SET_PW'}).encode()
         )))
     else:
-        print('DebugApp: REQUIRE_* received with unknown op; ignoring')
+        DebugApp.invoke('output', 'DebugApp: REQUIRE_* received with unknown op; ignoring')
 
 def handle_response(dm: DebugMessage):
     if len(dm.data):
@@ -3563,13 +3772,14 @@ def request_debug_info(op: int, peer_id: bytes, data: bytes = b''):
     dm = DebugMessage(op, int(time()), nonce, Packager.node_id, data)
     Gossip.invoke('publish', topic_id, serialize_dm(dm))
 
-def require_action(op: int, peer_id: bytes, data: bytes):
+def require_action(op: int, peer_id: bytes, pasw: bytes, more: bytes = b''):
     Gossip = Packager.apps.get(gossip_app_id, None)
     if Gossip is None:
         return
     peer_id = peer_id if type(peer_id) is bytes else bytes.fromhex(peer_id)
     topic_id = sha256(DebugApp.id + peer_id).digest()[:16]
     nonce = randint(0, 2**16 - 1)
+    data = len(more).to_bytes(1, 'big') + more + pasw
     dm = DebugMessage(op, int(time()), nonce, Packager.node_id, data)
     Gossip.invoke('publish', topic_id, serialize_dm(dm))
 
@@ -3585,6 +3795,123 @@ def stop_debug_app():
         topic_id = sha256(DebugApp.id + Packager.node_id).digest()[:16]
         Gossip.invoke('unsubscribe', topic_id, DebugApp.id)
 
+def hexify(thing):
+    if type(thing) is list:
+        return [hexify(i) for i in thing]
+    elif type(thing) is tuple:
+        return tuple(hexify(i) for i in thing)
+    elif type(thing) is bytes:
+        return thing.hex()
+    elif type(thing) is dict:
+        return {hexify(k): hexify(v) for k, v in thing.items()}
+    elif type(thing) in (int, float):
+        return thing
+    else:
+        return thing if type(thing) is str else repr(thing)
+
+async def _debug_command(cmd: list[str]):
+    """Debug a node."""
+    if len(cmd) < 2:
+        print('debug - missing a required arg')
+        return
+    nid = bytes.fromhex(cmd[0])
+    cmd[1] = cmd[1].lower()
+    nh_addr = b''
+    if cmd[1] not in ('info', 'peers', 'routes', 'next_hop'):
+        print(f'debug - unknown mode {cmd[1]}')
+        return
+    if cmd[1] == 'info':
+        op = DebugOp.REQUEST_NODE_INFO
+    elif cmd[1] == 'peers':
+        op = DebugOp.REQUEST_PEER_LIST
+    elif cmd[1] == 'routes':
+        op = DebugOp.REQUEST_ROUTES
+    elif cmd[1] == 'next_hop':
+        if len(cmd) < 4:
+            print('debug next_hop - missing a required arg')
+            return
+        nh_addr = Address.from_str(cmd[2])
+        metric = dCPL if 'cpl' in cmd[3].lower() else dTree
+        nh_addr = pack('!BB16s', metric, nh_addr.tree_state, nh_addr.address)
+        op = DebugOp.REQUEST_NEXT_HOP
+    output = DebugApp.params['console_output']
+    DebugApp.add_hook('output', lambda *args: output(args[1]))
+    DebugApp.add_hook(
+        'request',
+        lambda *args: output(f'DebugApp.request sent: {hexify(args[1:])}')
+    )
+    DebugApp.invoke('request', op, nid, nh_addr)
+    await DebugApp.params['console_wait'](2)
+
+async def _admin_command(cmd: list[str]):
+    """Execute admin command on a node."""
+    if len(cmd) < 3:
+        print('admin - missing a required arg')
+        return
+    nid = bytes.fromhex(cmd[0])
+    pasw = cmd[1].encode()
+    cmd[2] = cmd[2].lower()
+    if cmd[2] == 'reset':
+        op = DebugOp.REQUIRE_RESET
+        DebugApp.invoke('require', op, nid, pasw)
+        await DebugApp.params['console_wait'](1)
+    elif cmd[2] in ('ban', 'unban'):
+        if len(cmd) < 4:
+            print('admin - missing a required arg')
+            return
+        op = DebugOp.REQUIRE_BAN if cmd[2] == 'ban' else DebugOp.REQUIRE_UNBAN
+        pid = bytes.fromhex(cmd[3])
+        if len(pid) != 32:
+            print('admin - invalid peer_id')
+            return
+        DebugApp.invoke('require', op, nid, pasw, pid)
+        await DebugApp.params['console_wait'](1)
+    elif cmd[2] == 'set_pw':
+        if len(cmd) < 3:
+            print('admin - missing a required arg')
+            return
+        new_pasw = cmd[3].encode()
+        op = DebugOp.REQUIRE_SET_PW
+        DebugApp.invoke('require', op, nid, pasw, new_pasw)
+        await DebugApp.params['console_wait'](1)
+    else:
+        print(f'admin - unknown subcommand {cmd[2]}')
+        return
+
+async def _local_admin_command(cmd: list[str]):
+    """Execute admin command on the local node."""
+    if len(cmd) < 2:
+        print('local_admin - missing a required arg')
+        return
+    pasw = cmd[1].encode()
+    DebugApp.params['admin_pass_hash'] = sha256(pasw).digest()[:16]
+    print('local_admin - admin password set')
+
+def register_debug_cmds(
+        add_command: Callable, add_alias: Callable, wait: Callable,
+        output: Callable
+    ):
+    """Register console commands."""
+    DebugApp.params['console_wait'] = wait
+    DebugApp.params['console_output'] = output
+    add_command(
+        'debug',
+        _debug_command,
+        'debug [node_id] [info|peers|routes|next_hop addr metric] - get ' +
+            'debug info from a node'
+    )
+    add_command(
+        'admin',
+        _admin_command,
+        'admin [node_id] [passwd] [set_pw passwd|reset|ban peer_id|unban peer_id] ' +
+            '- execute an admin command on a node'
+    )
+    add_command(
+        'local_admin',
+        _local_admin_command,
+        'local_admin [set_pw passwd] - set the local admin password'
+    )
+
 DebugApp = Application(
     name='DebugApp',
     description='Debug App',
@@ -3598,13 +3925,17 @@ DebugApp = Application(
         'handle_response': lambda _, dm: handle_response(dm),
         'handle_require': lambda _, dm: handle_require(dm),
         'request': lambda _, op, peer_id, *args: request_debug_info(op, peer_id, *args),
-        'require': lambda _, op, peer_id, data: require_action(op, peer_id, data),
+        'require': lambda _, op, peer_id, pasw, *args: require_action(op, peer_id, pasw, *args),
         'deserialize': lambda _, blob: deserialize_dm(blob),
         'serialize': lambda _, dm: serialize_dm(dm),
         'start': lambda _: start_debug_app(),
         'stop': lambda _: stop_debug_app(),
         'get_seen': lambda _: seen_results,
         'auth_check': lambda _, data: debug_auth_check(data),
+        'register_commands': lambda _, *args, **kwargs: register_debug_cmds(*args, **kwargs),
+    },
+    params={
+        'admin_pass_hash': bytes.fromhex('32549bff6d8404c4d121b589f4d24ac6'),
     }
 )
 

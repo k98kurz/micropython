@@ -1,14 +1,19 @@
 from asyncio import sleep_ms
-from collections import deque
+from collections import deque, OrderedDict
 from machine import reset, Pin
 from micropycelium import (
     Packager, Address, dCPL, dTree, PROTOCOL_VERSION,
     ESPNowInterface, Beacon, Gossip, SpanningTree, Ping, DebugApp, DebugOp,
-    ainput, debug,
+    ainput, debug, iscoroutine,
 )
 from micropython import const
 from struct import pack
 import gc
+
+try:
+    from typing import Callable
+except:
+    pass
 
 
 MPNODE_VERSION = const('0.1.0-dev')
@@ -53,25 +58,12 @@ def debug_name(name: str):
         debug(name, *args)
     return inner
 
-def ping_cb(report):
-    if type(report) is str:
-        output(report)
-        return
-    report = hexify(report)
-    r = 'Ping report:\n'
-    for k, v in report.items():
-        r += f'  {k}: {v}\n'
-    output(r)
-
 hooks_added = False
 def add_hooks():
     global hooks_added
     if hooks_added:
         return
     hooks_added = True
-    ESPNowInterface.add_hook('process:receive', debug_name(f'Interface({ESPNowInterface.name}).process:receive'))
-    ESPNowInterface.add_hook('process:send', debug_name(f'Interface({ESPNowInterface.name}).process:send'))
-    ESPNowInterface.add_hook('process:broadcast', debug_name(f'Interface({ESPNowInterface.name}).process:broadcast'))
     Packager.add_hook('send', debug_name('Packager.send'))
     Packager.add_hook('broadcast', debug_name('Packager.broadcast'))
     Packager.add_hook('receive', debug_name('Packager.receive'))
@@ -79,11 +71,13 @@ def add_hooks():
     Packager.add_hook('receive:nia', debug_name('Packager.receive:nia'))
     Packager.add_hook('rns', debug_name('Packager.rns'))
     Packager.add_hook('send_packet', debug_name('Packager.send_packet'))
-    Packager.add_hook('_send_datagram', debug_name('Packager._send_datagram'))
     Packager.add_hook('deliver', debug_name('Packager.deliver'))
     Packager.add_hook('add_peer', debug_name('Packager.add_peer'))
+    Packager.add_hook('add_route', debug_name('Packager.add_route'))
     Packager.add_hook('set_addr', debug_name('Packager.set_addr'))
     Packager.add_hook('remove_peer', debug_name('Packager.remove_peer'))
+    Packager.add_hook('deliver:checksum_failed', debug_name('Packager.deliver:checksum_failed'))
+    Packager.add_hook('deliver:receive_failed', debug_name('Packager.deliver:receive_failed'))
     Packager.add_hook('modemsleep', debug_name('modemsleep'))
     Packager.add_hook('sleepskip', debug_name('sleepskip'))
 
@@ -99,26 +93,40 @@ async def memrloop():
             f'\t{al} ({al/(fr+al)*100:.2f}%) allocated'
         )
 
-def _help():
+
+commands: OrderedDict[str, tuple[Callable, str]] = OrderedDict()
+cmd_aliases: dict[str, str] = {}
+
+def add_command(name: str, func: Callable, help_text: str = ''):
+    """Add a command to the console. If help_text is empty, it will not
+        be mentioned when the "help" command is run.
+    """
+    commands[name] = (func, help_text)
+
+def add_cmd_alias(cmd: str, alias: str):
+    """Add an alias for a command."""
+    cmd_aliases[alias] = cmd
+
+def _indent(txt: str) -> str:
+    txt = txt.split('\n')
+    for i in range(len(txt)):
+        txt[i] = '\t' + txt[i]
+    return '\n'.join(txt)
+
+def _help(cmd = []):
+    if len(cmd):
+        cmd = cmd[0]
+        if cmd in cmd_aliases:
+            cmd = cmd_aliases[cmd]
+        if cmd in commands:
+            print(commands[cmd][1])
+            return
     print('Commands:')
-    print('\tm|monitor - monitors debug messages')
-    print('\tget [node_id|addrs|peers|routes|banned|next_hop addr metric] - get info from the local node')
-    print('\tban [node_id] - ban a node from being a peer or known route')
-    print('\tunban [node_id] - unban a node from being a peer or known route')
-    print('\tping [node_id|addr] [count] [timeout] - ping the node_id/address')
-    print('\t\tcount default value is 4')
-    print('\t\ttimeout default value is 5 (seconds)')
-    print('\t\tIf node_id is provided, the address will be found from the known routes')
-    print('\tgossip ping [node_id] [count] [timeout] - ping the node via gossip')
-    print('\t\tcount default value is 4')
-    print('\t\ttimeout default value is 5 (seconds)')
-    print('\tdebug [node_id] [info|peers|routes|next_hop addr metric] - get debug info from a node')
-    print('\tadmin [node_id] [password] [reset] - restart a remote node')
-    print('\tversion - show version information')
+    for _, v in commands.items():
+        if len(v[1]):
+            print(_indent(v[1]))
     print('\tq|quit - quit the program')
     print('\treset - reset the device')
-    print('\tw|wait [count] - wait for [count=-1] output messages (count<0 waits indefinitely)')
-    # print('\t - ')
 
 outq = deque([], 2)
 output = lambda res: outq.append(res)
@@ -132,22 +140,203 @@ async def wait(c = 1):
         if await ainput('', True) is not None:
             break
 
-async def monitor():
+def filter(msg, greps):
+    matched = len(greps) == 0
+    for p in greps:
+        if type(msg) is str and p in msg:
+            matched = True
+        elif type(msg) in (list, tuple):
+            for m in msg:
+                if type(m) is str and p in m:
+                    matched = True
+        elif type(msg) is dict:
+            for k, v in msg.values():
+                if (type(k) is str and p in k) or (
+                    type(v) is str and p in v
+                ):
+                    matched = True
+    return matched
+
+async def monitor(greps: tuple[str]|list[str] = []):
     print("Hit Enter to stop monitoring")
     while True:
         if len(debug_q):
-            print(*debug_q.popleft())
+            msg = debug_q.popleft()
+            if filter(msg, greps):
+                if type(msg) in (tuple, list):
+                    print(*msg)
+                else:
+                    print(msg)
         if len(outq):
-            print(outq.popleft())
+            msg = outq.popleft()
+            if filter(msg, greps):
+                print(msg)
         else:
             if await ainput('', True) is not None:
                 break
 
-async def console(add_debug_hooks = False, pub_routes = True, sub_routes = False):
+def _get(cmd):
+    if len(cmd) < 1:
+        print('get - missing a required arg')
+        return
+    if cmd[0].lower() == 'node_id':
+        print(f'Node ID: {Packager.node_id.hex()}')
+    elif cmd[0].lower() == 'addrs':
+        addrs = [a for a in Packager.node_addrs]
+        print(f'Addresses: {addrs}')
+    elif cmd[0].lower() == 'peers':
+        peers = [pid.hex() for pid in Packager.peers]
+        print(f'Peers:')
+        for peer in peers:
+            print(f'  {peer}')
+    elif cmd[0].lower() == 'routes':
+        print(f'Routes:')
+        for addr, pid in Packager.routes.items():
+            print(f'  {addr} -> {pid.hex()}')
+    elif cmd[0].lower() == 'banned':
+        print(f'Banned:')
+        for nid in Packager.banned:
+            print(f'  {nid.hex()}')
+    elif cmd[0].lower() == 'next_hop':
+        if len(cmd) < 3:
+            print('get next_hop - missing a required arg')
+            return
+        nh_addr = Address.from_str(cmd[1])
+        metric = dCPL if 'cpl' in cmd[2].lower() else dTree
+        nh = Packager.next_hop(nh_addr, metric)
+        if nh is None:
+            print(f'No next hop found for {nh_addr}')
+        else:
+            print(f'Next Hop: {nh[0].id.hex()} {nh[1]}')
+    elif cmd[0].lower() == 'apps':
+        print(f'Apps:')
+        for _, app in Packager.apps.items():
+            print(f'  {app.id.hex()} - {app.name} - version {app.version}')
+    elif cmd[0].lower() in ('sched', 'schedule'):
+        print(f'Schedule:')
+        for _, event in Packager.schedule.items():
+            print(f'  {event.id.hex()} - {event.handler.__name__} - {event.args} - {event.kwargs}')
+
+def _set(cmd):
+    if len(cmd) < 2:
+        print('set - missing a required arg')
+        return
+    if cmd[0].lower() == 'node_id':
+        if len(cmd[1]) != 64:
+            print('set node_id - invalid node_id')
+            return
+        Packager.set_node_id(bytes.fromhex(cmd[1]))
+    elif cmd[0].lower() == 'addr':
+        addr = Address.from_str(cmd[1])
+        Packager.set_addr(addr)
+    elif cmd[0].lower() == 'route':
+        if len(cmd) < 3:
+            print('set route - missing a required arg')
+            return
+        nid = bytes.fromhex(cmd[1])
+        addr = Address.from_str(cmd[2])
+        Packager.add_route(nid, addr)
+    else:
+        print(f'Unknown set option: {cmd[0]}')
+
+def _app(cmd):
+    if len(cmd) < 2:
+        print('app - missing a required arg')
+        return
+    app_id = bytes.fromhex(cmd[0])
+    if app_id not in Packager.apps:
+        print(f'Unknown app: {app_id.hex()}')
+        return
+    if cmd[1].lower() == 'start':
+        Packager.apps[app_id].invoke('start')
+    elif cmd[1].lower() == 'stop':
+        Packager.apps[app_id].invoke('stop')
+    else:
+        print(f'Unknown app command: {cmd[1]}')
+
+def _ban(cmd):
+    if len(cmd) < 1:
+        print('ban - missing a required arg')
+        return
+    try:
+        nid = bytes.fromhex(cmd[0])
+    except:
+        print(f'ban - invalid node_id: {cmd[0]}')
+        return
+    Packager.ban(nid)
+
+def _unban(cmd):
+    if len(cmd) < 1:
+        print('unban - missing a required arg')
+        return
+    try:
+        nid = bytes.fromhex(cmd[0])
+    except:
+        print(f'unban - invalid node_id: {cmd[0]}')
+        return
+    Packager.unban(nid)
+
+def _version(_):
+    print(f'MPNode version: {MPNODE_VERSION}')
+    print(f'Packager version: {Packager.version}')
+    print(f'Protocol version: {PROTOCOL_VERSION}')
+
+# register default console commands
+add_command('help', _help, '')
+add_cmd_alias('help', '?')
+add_cmd_alias('help', 'h')
+
+add_command(
+    'monitor', monitor,
+    'm|monitor [grep1] [grep2] ... - monitors debug messages\n' +
+        '\tgreps are optional; if supplied, only messages containing a ' +
+        'grep will be displayed'
+)
+add_cmd_alias('monitor', 'm')
+
+add_command(
+    'wait', lambda cmd: wait(int(cmd[0])) if cmd else wait(-1),
+    'w|wait [count] - wait for [count=-1] output messages (count<0 ' +
+        'waits indefinitely)'
+)
+add_cmd_alias('wait', 'w')
+
+add_command(
+    'get', _get,
+    'get [node_id|addrs|apps|sched|schedule|peers|routes|banned|next_hop addr metric] - ' +
+        'get info from the local node'
+)
+
+add_command(
+    'set', _set,
+    'set [node_id hex|addr str|route peer_id addr] - ' +
+        'set or add a config value for the local node'
+)
+
+add_command(
+    'app', _app,
+    'app [app_id] [start|stop] - start or stop an app'
+)
+
+add_command(
+    'ban', _ban, 'ban [node_id] - ban a node from being a peer or known route'
+)
+
+add_command(
+    'unban', _unban, 'unban [node_id] - unban a node from being a peer or known route'
+)
+
+Ping.invoke('register_commands', add_command, add_cmd_alias, wait, output)
+DebugApp.invoke('register_commands', add_command, add_cmd_alias, wait, output)
+
+add_command('version', _version, 'version - show version information')
+
+async def console(add_debug_hooks = True, pub_routes = True, sub_routes = False):
     if add_debug_hooks:
         add_hooks()
     SpanningTree.params['pub'] = pub_routes
     SpanningTree.params['sub'] = sub_routes
+    DebugApp.add_hook('output', lambda *args: output(args[1]))
     await monitor()
     while True:
         cmd = (await ainput("μpycelium> ")).split()
@@ -155,168 +344,16 @@ async def console(add_debug_hooks = False, pub_routes = True, sub_routes = False
             continue
         cmd[0] = cmd[0].lower()
         try:
-            if cmd[0] in ('?', 'h', 'help'):
-                _help()
-            elif cmd[0] in ('monitor', 'm'):
-                await monitor()
-            elif cmd[0] == 'get':
-                if len(cmd) < 2:
-                    print('get - missing a required arg')
-                    continue
-                if cmd[1].lower() == 'node_id':
-                    print(f'Node ID: {Packager.node_id.hex()}')
-                elif cmd[1].lower() == 'addrs':
-                    addrs = [a for a in Packager.node_addrs]
-                    print(f'Addresses: {addrs}')
-                elif cmd[1].lower() == 'peers':
-                    peers = [pid.hex() for pid in Packager.peers]
-                    print(f'Peers:')
-                    for peer in peers:
-                        print(f'  {peer}')
-                elif cmd[1].lower() == 'routes':
-                    print(f'Routes:')
-                    for addr, pid in Packager.routes.items():
-                        print(f'  {addr} -> {pid.hex()}')
-                elif cmd[1].lower() == 'banned':
-                    print(f'Banned:')
-                    for nid in Packager.banned:
-                        print(f'  {nid.hex()}')
-                elif cmd[1].lower() == 'next_hop':
-                    if len(cmd) < 4:
-                        print('get next_hop - missing a required arg')
-                        continue
-                    nh_addr = Address.from_str(cmd[2])
-                    metric = dCPL if 'cpl' in cmd[3].lower() else dTree
-                    nh = Packager.next_hop(nh_addr, metric)
-                    if nh is None:
-                        print(f'No next hop found for {nh_addr}')
-                    else:
-                        print(f'Next Hop: {nh[0].id.hex()} {nh[1]}')
-            elif cmd[0] == 'ban':
-                if len(cmd) < 2:
-                    print('ban - missing a required arg')
-                    continue
-                try:
-                    nid = bytes.fromhex(cmd[1])
-                except:
-                    print(f'ban - invalid node_id: {cmd[1]}')
-                    continue
-                Packager.ban(nid)
-            elif cmd[0] == 'unban':
-                if len(cmd) < 2:
-                    print('unban - missing a required arg')
-                    continue
-                try:
-                    nid = bytes.fromhex(cmd[1])
-                except:
-                    print(f'unban - invalid node_id: {cmd[1]}')
-                    continue
-                Packager.unban(nid)
-            elif cmd[0] == 'version':
-                print(f'MPNode version: {MPNODE_VERSION}')
-                print(f'Packager version: {Packager.version}')
-                print(f'Protocol version: {PROTOCOL_VERSION}')
+            if cmd[0] in cmd_aliases:
+                cmd[0] = cmd_aliases[cmd[0]]
+            if cmd[0] in commands:
+                co = commands[cmd[0]][0](cmd[1:])
+                if co is not None and iscoroutine(co):
+                    await co
             elif cmd[0] in ('quit', 'q'):
                 raise Exception('quit')
             elif cmd[0] == 'reset':
                 reset()
-            elif cmd[0] == 'ping':
-                if len(cmd) < 2:
-                    print('ping - missing required node_id|addr')
-                    continue
-                try:
-                    nid = bytes.fromhex(cmd[1])
-                    addr = None
-                except:
-                    nid = None
-                    addr = Address.from_str(cmd[1])
-                kwargs = {
-                    'node_id': nid,
-                    'addr': addr,
-                    'callback': ping_cb,
-                }
-                if len(cmd) > 2:
-                    kwargs['count'] = int(cmd[2])
-                if len(cmd) > 3:
-                    kwargs['timeout'] = int(cmd[3])
-                c = len(outq)
-                Ping.invoke('ping', **kwargs)
-                c += kwargs.get('count', 4)
-                await wait(c + 2)
-            elif cmd[0] == 'gossip':
-                if len(cmd) < 2:
-                    print('gossip - missing required subcommand')
-                    continue
-                if cmd[1].lower() == 'ping':
-                    if len(cmd) < 3:
-                        print('gossip ping - missing required addr')
-                        continue
-                    nid = bytes.fromhex(cmd[2])
-                    kwargs = {
-                        'node_id': nid,
-                        'callback': ping_cb,
-                    }
-                    if len(cmd) > 3:
-                        kwargs['count'] = int(cmd[3])
-                    if len(cmd) > 4:
-                        kwargs['timeout'] = int(cmd[4])
-                    c = len(outq)
-                    Ping.invoke('gossip_ping', **kwargs)
-                    await wait(kwargs.get('count', 4) + 2 + c)
-                else:
-                    print('unknown subcommand')
-                    continue
-            elif cmd[0] == 'debug':
-                if len(cmd) < 3:
-                    print('debug - missing a required arg')
-                    continue
-                nid = bytes.fromhex(cmd[1])
-                cmd[2] = cmd[2].lower()
-                nh_addr = b''
-                if cmd[2] not in ('info', 'peers', 'routes', 'next_hop'):
-                    print(f'debug - unknown mode {cmd[2]}')
-                    continue
-                if cmd[2] == 'info':
-                    op = DebugOp.REQUEST_NODE_INFO
-                elif cmd[2] == 'peers':
-                    op = DebugOp.REQUEST_PEER_LIST
-                elif cmd[2] == 'routes':
-                    op = DebugOp.REQUEST_ROUTES
-                elif cmd[2] == 'next_hop':
-                    if len(cmd) < 5:
-                        print('debug next_hop - missing a required arg')
-                        continue
-                    nh_addr = Address.from_str(cmd[3])
-                    metric = dCPL if 'cpl' in cmd[4].lower() else dTree
-                    nh_addr = pack('!BB16s', metric, nh_addr.tree_state, nh_addr.address)
-                    op = DebugOp.REQUEST_NEXT_HOP
-                DebugApp.add_hook('output', lambda *args: output(args[1]))
-                DebugApp.add_hook(
-                    'request',
-                    lambda *args: output(f'DebugApp.request sent: {hexify(args[1:])}')
-                )
-                c = len(outq)
-                DebugApp.invoke('request', op, nid, nh_addr)
-                await wait(c + 2)
-            elif cmd[0] == 'admin':
-                if len(cmd) < 4:
-                    print('admin - missing a required arg')
-                    continue
-                nid = bytes.fromhex(cmd[1])
-                cmd[3] = cmd[3].lower()
-                if cmd[3] == 'reset':
-                    op = DebugOp.REQUIRE_RESET
-                    c = len(outq)
-                    DebugApp.invoke('require', op, nid, cmd[2].encode())
-                    await wait(c + 1)
-                else:
-                    print(f'admin - unknown subcommand {cmd[3]}')
-                    continue
-            elif cmd[0] in ('wait', 'w'):
-                if len(cmd) < 2:
-                    await wait(-1)
-                else:
-                    await wait(int(cmd[1]))
             else:
                 print(f'Unknown command: {cmd[0]}')
                 _help()
@@ -369,6 +406,7 @@ def action_hook(name: str, c: tuple, q: deque):
         q.append(c)
     return inner
 
+# add some hooks
 Beacon.add_hook('receive', action_hook('Beacon.receive', blue, rq))
 Beacon.add_hook('broadcast', action_hook('Beacon.broadcast', red, rq))
 Beacon.add_hook('respond', action_hook('Beacon.respond', green, rq))
@@ -411,8 +449,22 @@ tasks = None
 
 async def _start(
         additional_tasks = [],
-        add_debug_hooks = False, pub_routes = True, sub_routes = False
+        add_debug_hooks = True, pub_routes = True, sub_routes = False,
+        add_intrfc_debug_hooks = False,
     ):
+    if add_intrfc_debug_hooks:
+        ESPNowInterface.add_hook(
+            'process:receive',
+            debug_name(f'Interface({ESPNowInterface.name}).process:receive')
+        )
+        ESPNowInterface.add_hook(
+            'process:send',
+            debug_name(f'Interface({ESPNowInterface.name}).process:send')
+        )
+        ESPNowInterface.add_hook(
+            'process:broadcast',
+            debug_name(f'Interface({ESPNowInterface.name}).process:broadcast')
+        )
     Beacon.invoke('start')
     Gossip.invoke('start')
     SpanningTree.invoke('start')
@@ -447,7 +499,11 @@ async def _start(
 
 def start(
         additional_tasks = [],
-        add_debug_hooks = False, pub_routes = True, sub_routes = False
+        add_debug_hooks = True, pub_routes = True, sub_routes = False,
+        add_intrfc_debug_hooks = False,
     ):
-    run(_start(additional_tasks, add_debug_hooks, pub_routes, sub_routes))
+    run(_start(
+        additional_tasks, add_debug_hooks, pub_routes, sub_routes,
+        add_intrfc_debug_hooks,
+    ))
 
