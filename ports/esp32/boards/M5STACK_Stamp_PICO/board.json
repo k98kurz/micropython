@@ -3,7 +3,7 @@
         "../deploy.md"
     ],
     "deploy_options": {
-        "flash_offset": "0x1000"
+        "flash_offset": "0"
     },
     "docs": "https://docs.m5stack.com/en/core/stamp_pico",
     "features": [
