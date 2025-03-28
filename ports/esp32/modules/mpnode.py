@@ -251,6 +251,8 @@ def _app(cmd):
         Packager.apps[app_id].invoke('start')
     elif cmd[1].lower() == 'stop':
         Packager.apps[app_id].invoke('stop')
+    elif cmd[1].lower() == 'invoke':
+        Packager.apps[app_id].invoke(*cmd[2:])
     else:
         print(f'Unknown app command: {cmd[1]}')
 
@@ -315,7 +317,8 @@ add_command(
 
 add_command(
     'app', _app,
-    'app [app_id] [start|stop] - start or stop an app'
+    'app [app_id] [start|stop|invoke name ...args] - start or stop an app, or ' +
+        'invoke an app command'
 )
 
 add_command(
@@ -363,9 +366,7 @@ async def console(add_debug_hooks = True, pub_routes = True, sub_routes = False)
             print(f'Error: {e}')
 # save_imports
 from asyncio import run, gather, create_task
-from machine import Pin
 from neopixel import NeoPixel
-
 
 # RGB LED of the M5stamp-Pico
 rgb = NeoPixel(Pin(27, Pin.OUT), 1)
@@ -493,7 +494,8 @@ async def _start(
             except Exception as e:
                 if str(e) == 'quit':
                     break
-    except OSError:
+                raise e
+    except OSError as e:
         print('OSError encountered; resetting device')
         reset()
 
@@ -506,4 +508,3 @@ def start(
         additional_tasks, add_debug_hooks, pub_routes, sub_routes,
         add_intrfc_debug_hooks,
     ))
-
