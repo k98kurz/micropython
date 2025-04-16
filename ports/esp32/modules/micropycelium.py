@@ -39,7 +39,7 @@ else:
     sleep_ms = lambda ms: asyncio.sleep(ms/1000)
 
 
-VERSION = micropython.const('0.1.0-dev')
+VERSION = micropython.const('0.1.0-prerelease1')
 PROTOCOL_VERSION = micropython.const(0)
 DEBUG = True
 MODEM_SLEEP_MS = micropython.const(90)
@@ -1223,11 +1223,11 @@ class Address:
     @staticmethod
     def dCPL(x1: 'Address', x2: 'Address') -> int:
         """Calculate the CPL distance between two addresses."""
-        x1 = x1.dCPL_coords()
-        x2 = x2.dCPL_coords()
+        x1l, x2l = len(x1.coords), len(x2.coords)
+        x1, x2 = x1.dCPL_coords(), x2.dCPL_coords()
         if x1 == x2:
             return 0
-        return 33 - Address.cpl(x1, x2) - 1 / (len(x1) + len(x2) + 1)
+        return 33 - Address.cpl(x1, x2) - 1 / (x1l + x2l + 1)
 
 
 # @micropython.native
@@ -2333,8 +2333,8 @@ Packager.add_interface(InterAppInterface)
 
 
 BeaconMessage = namedtuple("BeaconMessage", ['op', 'peer_id', 'apps'])
-seen_bm: deque[BeaconMessage] = deque([], 10)
-sent_bm: deque[BeaconMessage] = deque([], 10)
+seen_bm: deque[BeaconMessage] = deque([], 4)
+sent_bm: deque[BeaconMessage] = deque([], 4)
 beacon_app_id = b''
 
 
@@ -2485,9 +2485,9 @@ GossipMessage = namedtuple("GossipMessage", ['op', 'topic_id', 'data'])
 # map of topic_id to list of application_ids
 subscriptions: dict[bytes, list[bytes]] = {}
 # buffer of seen message ids (half_sha256)
-seen_gm: deque[bytes] = deque([], 100)
+seen_gm: deque[bytes] = deque([], 10)
 # cache of GossipMessages
-message_cache: Cache = Cache(limit=100)
+message_cache: Cache = Cache(limit=10)
 # id of this gossip application
 gossip_app_id: bytes = b''
 
@@ -2826,6 +2826,9 @@ def receive_tm(app: Application, blob: bytes, intrfc: Interface, mac: bytes):
                 coords = list(Packager.node_addrs[-1].coords) + [current_children[peer_id]]
                 SpanningTree.invoke('assign_address', peer_id, coords)
                 return
+            # ignore requests from the parent; tree is timing out
+            if tmsg.node_id == current_parent:
+                return
             # respond with the address assignment
             coords = list(Packager.node_addrs[-1].coords)
             coord = lwst_avlbl_coord()
@@ -2998,8 +3001,10 @@ def set_addr_gossip_callback(_, addr: Address):
     send_gossip_tree_message(addr)
 
 def schedule_start(pub = None, sub = None):
-    """Schedules the app to start broadcasting with a random delay up to
-        params['max_start_delay'] ms.
+    """Schedules the app to start broadcasting with a pseudo-random
+        delay of a minimum of params['tree_maintenance_delay'] ms and
+        a maximum of params['tree_maintenance_delay'] +
+        params['max_start_delay_add'] ms.
     """
     if type(pub) is bool:
         SpanningTree.params['pub'] = pub
@@ -3010,7 +3015,8 @@ def schedule_start(pub = None, sub = None):
     current_best_root_id = Packager.node_id
     Packager.set_addr(Address(tree_state(Packager.node_id), coords=[]))
     Packager.new_events.append(Event(
-        now() + randint(0, SpanningTree.params['max_start_delay']),
+        now() + SpanningTree.params['tree_maintenance_delay'] +
+            randint(0, SpanningTree.params['max_start_delay_add']),
         tree_app_id + b's',
         maintain_tree,
     ))
@@ -3058,7 +3064,7 @@ SpanningTree = Application(
         'get_seen': lambda _: seen_tm,
     },
     params={
-        'max_start_delay': 10_000,
+        'max_start_delay_add': 10_000,
         'tree_maintenance_delay': 20_000,
         'max_tree_age': 60,
         # 'broadcast_count': MODEM_INTERSECT_RTX_TIMES,
@@ -3268,6 +3274,14 @@ def report_ping_test(
             relevant_pms.append(pm)
         else:
             ping_responses.append(pm)
+    # deduplicate relevant pms by ts1
+    ts1s = set()
+    final_pms = []
+    for pm in relevant_pms:
+        if pm.ts1 not in ts1s:
+            ts1s.add(pm.ts1)
+            final_pms.append(pm)
+    relevant_pms = final_pms
     # generate report
     if type(remote_id_or_addr) is bytes:
         remote = remote_id_or_addr.hex()
@@ -3470,6 +3484,8 @@ async def _ping_command(cmd: list[str]):
         kwargs['count'] = int(cmd[1])
     if len(cmd) > 2:
         kwargs['timeout'] = int(cmd[2])
+    if len(cmd) > 3:
+        kwargs['metric'] = dCPL if 'cpl' in cmd[3].lower() else dTree
     Ping.invoke('ping', **kwargs)
     await Ping.params['console_wait'](kwargs.get('count', 4) + 2)
 
@@ -3501,11 +3517,12 @@ def register_ping_cmds(
     add_command(
         'ping',
         _ping_command,
-        'ping [node_id|addr] [count] [timeout] - ping the node_id/address\n' +
+        'ping [node_id|addr] [count] [timeout] [metric] - ping the node_id/address\n' +
             '\tcount should be <=10 (memory constraint); default value is 4\n' +
             '\ttimeout default value is 2 (seconds)\n' +
             '\tIf node_id is provided, it will attempt to find the address ' +
-            'from the known routes'
+            'from the known routes\n' +
+            '\tmetric should be dTree or dCPL; default value is dTree'
     )
     add_command(
         'gossip_ping',
@@ -3550,10 +3567,12 @@ DebugOp = enum(
     REQUEST_PEER_LIST = 1,
     REQUEST_ROUTES = 2,
     REQUEST_NEXT_HOP = 3,
+    REQUEST_BANNED = 4,
     RESPOND_NODE_INFO = 100,
     RESPOND_PEER_LIST = 101,
     RESPOND_ROUTES = 102,
     RESPOND_NEXT_HOP = 103,
+    RESPOND_BANNED = 104,
     # ERROR = 199,
     OK = 200,
     AUTH_ERROR = 201,
@@ -3568,10 +3587,12 @@ _inverse_op = {
     DebugOp.REQUEST_PEER_LIST: 'REQUEST_PEER_LIST',
     DebugOp.REQUEST_ROUTES: 'REQUEST_ROUTES',
     DebugOp.REQUEST_NEXT_HOP: 'REQUEST_NEXT_HOP',
+    DebugOp.REQUEST_BANNED: 'REQUEST_BANNED',
     DebugOp.RESPOND_NODE_INFO: 'RESPOND_NODE_INFO',
     DebugOp.RESPOND_PEER_LIST: 'RESPOND_PEER_LIST',
     DebugOp.RESPOND_ROUTES: 'RESPOND_ROUTES',
     DebugOp.RESPOND_NEXT_HOP: 'RESPOND_NEXT_HOP',
+    DebugOp.RESPOND_BANNED: 'RESPOND_BANNED',
     # DebugOp.ERROR: 'ERROR',
     DebugOp.OK: 'OK',
     DebugOp.AUTH_ERROR: 'AUTH_ERROR',
@@ -3584,7 +3605,7 @@ _inverse_op = {
 DebugMessage = namedtuple('DebugMessage', ['op', 'ts', 'nonce', 'from_id', 'data'])
 
 gossip_app_id = bytes.fromhex('849969c1f22797d66f5a94db2afe634a')
-seen_results: deque[dict] = deque([], 10)
+seen_results: deque[dict] = deque([], 4)
 
 def debug_auth_check(data: bytes):
     auth_hash1 = sha256(data).digest()[:16]
@@ -3609,6 +3630,8 @@ def receive_debug(app: Application, blob: bytes, intrfc: Interface, mac: bytes):
         DebugApp.invoke('handle_request_routes', dm)
     elif dm.op == DebugOp.REQUEST_NEXT_HOP:
         DebugApp.invoke('handle_request_next_hop', dm)
+    elif dm.op == DebugOp.REQUEST_BANNED:
+        DebugApp.invoke('handle_request_banned', dm)
     elif dm.op == DebugOp.RESPOND_NODE_INFO:
         DebugApp.invoke('handle_response', dm)
     elif dm.op == DebugOp.RESPOND_PEER_LIST:
@@ -3616,6 +3639,8 @@ def receive_debug(app: Application, blob: bytes, intrfc: Interface, mac: bytes):
     elif dm.op == DebugOp.RESPOND_ROUTES:
         DebugApp.invoke('handle_response', dm)
     elif dm.op == DebugOp.RESPOND_NEXT_HOP:
+        DebugApp.invoke('handle_response', dm)
+    elif dm.op == DebugOp.RESPOND_BANNED:
         DebugApp.invoke('handle_response', dm)
     elif dm.op == DebugOp.OK:
         DebugApp.invoke('handle_response', dm)
@@ -3652,7 +3677,8 @@ def handle_request_peer_list(dm: DebugMessage):
     }
     topic_id = sha256(DebugApp.id + dm.from_id).digest()[:16]
     new_dm = DebugMessage(
-        DebugOp.RESPOND_PEER_LIST, int(time()), dm.nonce, Packager.node_id, json.dumps(info).encode()
+        DebugOp.RESPOND_PEER_LIST, int(time()), dm.nonce, Packager.node_id,
+        json.dumps(info).encode()
     )
     Gossip.invoke('publish', topic_id, serialize_dm(new_dm))
 
@@ -3686,6 +3712,19 @@ def handle_request_next_hop(dm: DebugMessage):
     topic_id = sha256(DebugApp.id + dm.from_id).digest()[:16]
     Gossip.invoke('publish', topic_id, serialize_dm(DebugMessage(
         DebugOp.RESPOND_NEXT_HOP, int(time()), dm.nonce, Packager.node_id,
+        json.dumps(info).encode()
+    )))
+
+def handle_request_banned(dm: DebugMessage):
+    Gossip = Packager.apps.get(gossip_app_id, None)
+    if Gossip is None:
+        return
+    info = {
+        'banned': [node_id.hex() for node_id in Packager.banned],
+    }
+    topic_id = sha256(DebugApp.id + dm.from_id).digest()[:16]
+    Gossip.invoke('publish', topic_id, serialize_dm(DebugMessage(
+        DebugOp.RESPOND_BANNED, int(time()), dm.nonce, Packager.node_id,
         json.dumps(info).encode()
     )))
 
@@ -3817,7 +3856,7 @@ async def _debug_command(cmd: list[str]):
     nid = bytes.fromhex(cmd[0])
     cmd[1] = cmd[1].lower()
     nh_addr = b''
-    if cmd[1] not in ('info', 'peers', 'routes', 'next_hop'):
+    if cmd[1] not in ('info', 'peers', 'routes', 'next_hop', 'banned'):
         print(f'debug - unknown mode {cmd[1]}')
         return
     if cmd[1] == 'info':
@@ -3834,6 +3873,8 @@ async def _debug_command(cmd: list[str]):
         metric = dCPL if 'cpl' in cmd[3].lower() else dTree
         nh_addr = pack('!BB16s', metric, nh_addr.tree_state, nh_addr.address)
         op = DebugOp.REQUEST_NEXT_HOP
+    elif cmd[1] == 'banned':
+        op = DebugOp.REQUEST_BANNED
     output = DebugApp.params['console_output']
     DebugApp.add_hook('output', lambda *args: output(args[1]))
     DebugApp.add_hook(
@@ -3897,7 +3938,7 @@ def register_debug_cmds(
     add_command(
         'debug',
         _debug_command,
-        'debug [node_id] [info|peers|routes|next_hop addr metric] - get ' +
+        'debug [node_id] [info|peers|banned|routes|next_hop addr metric] - get ' +
             'debug info from a node'
     )
     add_command(
@@ -3922,6 +3963,7 @@ DebugApp = Application(
         'handle_request_peer_list': lambda _, dm: handle_request_peer_list(dm),
         'handle_request_routes': lambda _, dm: handle_request_routes(dm),
         'handle_request_next_hop': lambda _, dm: handle_request_next_hop(dm),
+        'handle_request_banned': lambda _, dm: handle_request_banned(dm),
         'handle_response': lambda _, dm: handle_response(dm),
         'handle_require': lambda _, dm: handle_require(dm),
         'request': lambda _, op, peer_id, *args: request_debug_info(op, peer_id, *args),
